@@ -126,6 +126,12 @@ def create_universe_histograms(vals, bins, sys_weight_arrs, other_weights, descr
 
 
 def create_rw_frac_cov_matrices(mc_pred_df, var, bins, weights_df=None):
+    #mc_pred_df = polars dataframe of mc prediction cv
+    #var = string of var name
+    #bins = array of bin edges
+    #weights_df = weights polars df, if None loads from file (hardcoded below)
+
+    #uses wc_net_weight (should be "weight" in my files)
 
     print("creating reweightable systematic covariance matrices...")
 

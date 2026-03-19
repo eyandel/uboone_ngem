@@ -4,6 +4,7 @@ import numpy as np
 import pandas as pd
 import polars as pl
 import os
+import gc
 import time
 import argparse
 
@@ -12,8 +13,9 @@ from ntuple_variables.variables import wc_T_BDT_including_training_vars, wc_T_KI
 from ntuple_variables.variables import wc_T_spacepoints_vars, wc_T_eval_vars, wc_T_pf_vars, wc_T_pf_data_vars, wc_T_eval_data_vars
 from ntuple_variables.variables import blip_vars, pandora_vars, glee_vars, lantern_vars, vector_columns
 from postprocessing import do_orthogonalization_and_POT_weighting, add_extra_true_photon_variables, do_spacepoint_postprocessing, add_signal_categories
-from postprocessing import do_wc_postprocessing, do_pandora_postprocessing, do_blip_postprocessing, do_lantern_postprocessing, do_combined_postprocessing, do_glee_postprocessing
-from postprocessing import remove_vector_variables
+from postprocessing import do_wc_postprocessing, do_pandora_postprocessing, do_lantern_postprocessing, do_combined_postprocessing, do_glee_postprocessing
+from blip_postprocessing import do_blip_postprocessing
+from postprocessing import remove_vector_variables, add_1g1mu_rad_corr_events, add_nc_coh_1g_reweighted_events
 
 from file_locations import data_files_location, intermediate_files_location
 
@@ -37,7 +39,7 @@ def process_root_file(filename, frac_events = 1):
     elif "isotropic_one_gamma" in filename.lower():
         filetype = "isotropic_one_gamma_overlay"
     else:
-        raise ValueError("Unknown filetype!", filename, filetype)
+        raise ValueError("Unknown filetype!", filename)
 
     if "lya" in filename.lower():
         vartype = "LYAtt"
@@ -47,6 +49,8 @@ def process_root_file(filename, frac_events = 1):
         vartype = "LYRayleigh"
     elif "wmx" in filename.lower():
         vartype = "WireModX"
+    elif "wmyz" in filename.lower():
+        vartype = "WireModYZ"
     elif "recomb2" in filename.lower():
         vartype = "Recomb2"
     elif "sce" in filename.lower():
@@ -54,7 +58,7 @@ def process_root_file(filename, frac_events = 1):
     elif "cv" in filename.lower():
         vartype = "CV"
     else:
-        raise ValueError("Unknown vartype!", filename, vartype)
+        raise ValueError("Unknown vartype!", filename)
     
     root_file_size_gb = os.path.getsize(f"{data_files_location}/{filename}") / 1024**3
 
@@ -157,18 +161,23 @@ def process_root_file(filename, frac_events = 1):
         detailed_run_period = "4c"
     elif "4d.root" in filename:
         detailed_run_period = "4d"
+    elif "4bcd.root" in filename:
+        detailed_run_period = "4bcd"
     elif "5.root" in filename:
         detailed_run_period = "5"
-    elif "run4b" in filename.lower(): # if the filename doesn't end with the run period, look for run strings in the file names
+    
+    elif "4a" in filename.lower(): # if the filename doesn't end with the run period, look for run strings in the file names
+        detailed_run_period = "4a"
+    elif "run4b" in filename.lower():
         detailed_run_period = "4b"
     elif "run4c" in filename.lower():
         detailed_run_period = "4c"
     elif "run4d" in filename.lower():
         detailed_run_period = "4d"
+    elif "run4bcd" in filename.lower():
+        detailed_run_period = "4bcd"
     elif "run5" in filename.lower():
         detailed_run_period = "5"
-    elif "run45" in filename.lower():
-        detailed_run_period = "45"
     else:
         raise ValueError("Invalid detailed run period!", filename)
 
@@ -190,7 +199,7 @@ def process_root_file(filename, frac_events = 1):
         progress_str += f" (f={frac_events})"
     print(progress_str)
 
-    return filetype, vartype, all_df, file_POT
+    return filetype, detailed_run_period, vartype, all_df, file_POT
 
 
 if __name__ == "__main__":
@@ -232,6 +241,8 @@ if __name__ == "__main__":
     filenames.sort()
     # sorting these puts an NC Pi0 overlay first, which will have all the WCPMTInfo and truth variables present, 
     # so it can be used to add columns to future dataframes with missing values
+
+    pot_dic = {}
     
     for file_num, filename in enumerate(filenames):
 
@@ -241,29 +252,16 @@ if __name__ == "__main__":
         if "UNUSED" in filename or "older_downloads" in filename:
             continue
 
+        if "nfs000000150070ba7d00000751" in filename: # TEMPORARY: weird file in directory now
+            continue
+
         if not "detvar" in filename.lower():
             continue
 
-        filetype, vartype, curr_df, curr_POT = process_root_file(filename, frac_events=args.frac_events)
+        filetype, detailed_run_period, vartype, curr_df, curr_POT = process_root_file(filename, frac_events=args.frac_events)
 
         if vartype == "CV":
-            if filetype == "nc_pi0_overlay":
-                all_cv_nc_pi0_POTs.append(curr_POT)
-            elif filetype == "numucc_pi0_overlay":
-                all_cv_numucc_pi0_POTs.append(curr_POT)
-            elif filetype == "nu_overlay":
-                all_cv_nu_POTs.append(curr_POT)
-            elif filetype == "nue_overlay":
-                all_cv_nue_POTs.append(curr_POT)
-            elif filetype == "dirt_overlay":
-                all_cv_dirt_POTs.append(curr_POT)
-            elif filetype == "delete_one_gamma_overlay":
-                all_cv_delete_one_gamma_POTs.append(curr_POT)
-            elif filetype == "isotropic_one_gamma_overlay":
-                all_cv_isotropic_one_gamma_POTs.append(curr_POT)
-            else:
-                raise ValueError("Unknown filetype!", filetype)
-
+            pot_dic[(filetype, detailed_run_period)] = curr_POT
 
         print("doing post-processing that requires vector variables...")
 
@@ -337,25 +335,34 @@ if __name__ == "__main__":
     
     print(f"all_df.height={all_df.height}")
 
-    # TODO: When we have more files, do weighting to make each set of run fractions match the run fractions in data
-
-    pot_dic = {
-        "nc_pi0_overlay": sum(all_cv_nc_pi0_POTs),
-        "numucc_pi0_overlay": sum(all_cv_numucc_pi0_POTs),
-        "nu_overlay": sum(all_cv_nu_POTs),
-        "nue_overlay": sum(all_cv_nue_POTs),
-        "dirt_overlay": sum(all_cv_dirt_POTs),
-        "delete_one_gamma_overlay": sum(all_cv_delete_one_gamma_POTs),
-        "isotropic_one_gamma_overlay": sum(all_cv_isotropic_one_gamma_POTs),
-    }
-
     print("doing post-processing that doesn't require vector variables using polars...")
 
     all_df = do_combined_postprocessing(all_df)
-    normalizing_POT = 1.11e21
+    #normalizing_POT = 1.11e21
+    normalizing_POT = 2.098e19 + 4.038e19 # for run 4a and run 4b open data
     
     all_df = do_orthogonalization_and_POT_weighting(all_df, pot_dic, normalizing_POT=normalizing_POT)
     all_df = add_signal_categories(all_df)
+
+    temp_defrag_path = f"{intermediate_files_location}/_temp_defrag_detvar_df.parquet"
+    print(f"Writing temp parquet to {temp_defrag_path}...", end="", flush=True)
+    all_df.lazy().sink_parquet(temp_defrag_path)
+    print("done")
+    gc.collect()
+
+    all_lf = pl.scan_parquet(temp_defrag_path)
+    rad_corrected_df = add_1g1mu_rad_corr_events(all_lf)
+    coherent_1g_df = add_nc_coh_1g_reweighted_events(all_lf)
+    del all_lf
+
+    all_df = pl.read_parquet(temp_defrag_path)
+    os.remove(temp_defrag_path)
+    gc.collect()
+
+    all_df = pl.concat([all_df, rad_corrected_df, coherent_1g_df], how="diagonal_relaxed")
+    del rad_corrected_df, coherent_1g_df
+    gc.collect()
+    print(f"  all_df has {all_df.height} rows after adding rad_corr and coherent events")
 
     file_RSEs = []
     for filetype, vartype, run, subrun, event in zip(all_df["filetype"].to_numpy(), all_df["vartype"].to_numpy(), all_df["run"].to_numpy(), all_df["subrun"].to_numpy(), all_df["event"].to_numpy()):

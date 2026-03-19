@@ -1,4 +1,6 @@
 
+import gc
+import ctypes
 import uproot
 import numpy as np
 import pandas as pd
@@ -12,8 +14,10 @@ from ntuple_variables.variables import wc_T_BDT_including_training_vars, wc_T_KI
 from ntuple_variables.variables import wc_T_spacepoints_vars, wc_T_eval_vars, wc_T_pf_vars, wc_T_pf_data_vars, wc_T_eval_data_vars
 from ntuple_variables.variables import blip_vars, pandora_vars, glee_vars, lantern_vars, vector_columns
 from postprocessing import do_orthogonalization_and_POT_weighting, add_extra_true_photon_variables, do_spacepoint_postprocessing, add_signal_categories
-from postprocessing import do_wc_postprocessing, do_pandora_postprocessing, do_blip_postprocessing, do_lantern_postprocessing, do_combined_postprocessing, do_glee_postprocessing
-from postprocessing import remove_vector_variables
+from postprocessing import do_wc_postprocessing, do_pandora_postprocessing, do_lantern_postprocessing, do_combined_postprocessing, do_glee_postprocessing
+from blip_postprocessing import do_blip_postprocessing
+from postprocessing import remove_vector_variables, change_dtypes
+from postprocessing import add_1g1mu_rad_corr_events, add_nc_coh_1g_reweighted_events
 
 from file_locations import data_files_location, intermediate_files_location
 
@@ -41,7 +45,7 @@ def process_root_file(filename, frac_events = 1):
     elif "beam_on" in filename.lower():
         filetype = "data"
     else:
-        raise ValueError("Unknown filetype!", filename, filetype)
+        raise ValueError("Unknown filetype!", filename)
     
     root_file_size_gb = os.path.getsize(f"{data_files_location}/{filename}") / 1024**3
 
@@ -51,28 +55,24 @@ def process_root_file(filename, frac_events = 1):
 
     f = uproot.open(f"{data_files_location}/{filename}")
 
-    if filetype == "data": # quartering the data to use as open data
-        curr_frac_events = frac_events / 4
-    else:
-        curr_frac_events = frac_events
-
     # determine how many events to read based on requested fraction
     if not (0.0 < frac_events <= 1.0):
         raise ValueError("--frac_events/-f must be in the interval (0, 1].")
     total_entries = f["wcpselection"]["T_eval"].num_entries
-    n_events = total_entries if curr_frac_events >= 1.0 else max(1, int(total_entries * curr_frac_events))
+    n_events = total_entries if frac_events >= 1.0 else max(1, int(total_entries * frac_events))
     slice_kwargs = {} if n_events >= total_entries else {"entry_stop": n_events}
 
-    print(f"{total_entries=}, {curr_frac_events=}, {n_events=}")
+    print(f"{total_entries=}, {frac_events=}, {n_events=}")
 
 
     curr_wc_T_pf_vars = wc_T_pf_vars
 
     curr_wc_T_BDT_including_training_vars = wc_T_BDT_including_training_vars
-    if "v10_04_07_09" in filename:
+    if (("v10_04_07_09" in filename) or (filename == "checkout_MCC9.10_Run4b_v10_04_07_20_BNB_beam_off_metapatch_retuple_retuple_hist.root")
+                 or (filename == "checkout_MCC9.10_Run4b_v10_04_07_20_BNB_nu_overlay_retuple_retuple_hist.root")):
         print(f"    TEMPORARY: NOT LOADING WCPMTInfo VARIABLES FOR {filetype}")
         curr_wc_T_BDT_including_training_vars = [var for var in wc_T_BDT_including_training_vars if "WCPMTInfo" not in var]
-            
+    
 
     # loading Wire-Cell variables
     dic = {}
@@ -90,24 +90,47 @@ def process_root_file(filename, frac_events = 1):
         dic[col] = dic[col].tolist()
     wc_df = pd.DataFrame(dic)
 
-    if filetype == "ext":
-        # TODO: When we have more files, do weighting to make each set of run fractions match the run fractions in data
+    # data and EXT POT and trigger numbers from https://docs.google.com/spreadsheets/d/1RUiX2M6zoob9R0YWPLummHzmX5UeLLEtS-7ZU-x2gA4
+    # also from Karan's processing, https://docs.google.com/document/d/1SWZtfo9MIGpODVopGwWTM2LNEN-d7GmkWhYOmChK4kk/edit?tab=t.0
 
-        # trigger numbers from https://docs.google.com/spreadsheets/d/1RUiX2M6zoob9R0YWPLummHzmX5UeLLEtS-7ZU-x2gA4
-        if filename == "MCC9.10_Run4b_v10_04_07_09_Run4b_BNB_beam_off_surprise_reco2_hist.root":
-            ext_num_triggers = 88445969
-            corresponding_data_num_triggers = 31582916
-            corresponding_data_POT = 1.332e20
-            file_POT_total = corresponding_data_POT * ext_num_triggers / corresponding_data_num_triggers
+    # using these numbers for now
+    # eventually can replace these with the full data statistics, to get a more accurate POT/trigger ratio in each run period
+    run4a_open_data_POT = 2.098e19
+    run4a_open_data_num_triggers = 4836758
+    run4a_pot_per_trigger = run4a_open_data_POT / run4a_open_data_num_triggers
+
+    run4b_open_data_POT = 4.038e19
+    run4b_open_data_num_triggers = 9218529
+    run4b_pot_per_trigger = run4b_open_data_POT / run4b_open_data_num_triggers
+
+    if filetype == "ext":
+        
+        if filename == "checkout_MCC9.10_Run4a_BNB_beam_off_data_surprise_reco2_hist.root": # run 4a
+            run4a_ext_num_triggers = 27940007
+            file_POT_total = run4a_ext_num_triggers * run4a_pot_per_trigger
+        elif filename == "checkout_MCC9.10_Run4b_v10_04_07_20_BNB_beam_off_metapatch_retuple_retuple_hist.root": # run 4b
+            run4b_ext_num_triggers = 89010180
+            file_POT_total = run4b_ext_num_triggers * run4b_pot_per_trigger
+        elif filename == "checkout_MCC9.10_Run4acd5_v10_04_07_14_BNB_beam_off_surprise_reco2_hist_4c.root": # run 4c
+            run4b_ext_num_triggers = 53659787
+            file_POT_total = run4b_ext_num_triggers * run4b_pot_per_trigger
+        elif filename == "checkout_MCC9.10_Run4acd5_v10_04_07_14_BNB_beam_off_surprise_reco2_hist_4d.root": # run 4d
+            run4b_ext_num_triggers = 76563108
+            file_POT_total = run4b_ext_num_triggers * run4b_pot_per_trigger
+        elif filename == "checkout_MCC9.10_Run4acd5_v10_04_07_14_BNB_beam_off_surprise_reco2_hist_5.root": # run 5
+            run4b_ext_num_triggers = 111457148
+            file_POT_total = run4b_ext_num_triggers * run4b_pot_per_trigger
         else:
             raise ValueError("Invalid EXT file, num triggers not found!")
     elif filetype == "data":
-        if filename == "MCC9.10_Run4b_v10_04_07_11_BNB_beam_on_surprise_reco2_hist.root":
-            file_POT_total = 1.332e20
+        if filename == "checkout_MCC9.10_Run4a_BNB_beam_on_data_surprise_reco2_hist_opendata_19550.root": # run 4a open data
+            file_POT_total = run4a_open_data_POT
+        elif filename == "checkout_MCC9.10_Run4b_v10_04_07_20_BNB_beam_on_metapatch_retuple_retuple_hist_opendata_20700.root": # run 4b open data
+            file_POT_total = run4b_open_data_POT
         else:
             raise ValueError("Invalid data file!")
     
-    file_POT = file_POT_total * curr_frac_events
+    file_POT = file_POT_total * frac_events
     wc_df["wc_file_POT"] = file_POT
     
     # loading blip variables
@@ -166,18 +189,23 @@ def process_root_file(filename, frac_events = 1):
         detailed_run_period = "4c"
     elif "4d.root" in filename:
         detailed_run_period = "4d"
+    elif "4bcd.root" in filename:
+        detailed_run_period = "4bcd"
     elif "5.root" in filename:
         detailed_run_period = "5"
-    elif "run4b" in filename.lower(): # if the filename doesn't end with the run period, look for run strings in the file names
+    
+    elif "4a" in filename.lower(): # if the filename doesn't end with the run period, look for run strings in the file names
+        detailed_run_period = "4a"
+    elif "run4b" in filename.lower():
         detailed_run_period = "4b"
     elif "run4c" in filename.lower():
         detailed_run_period = "4c"
     elif "run4d" in filename.lower():
         detailed_run_period = "4d"
+    elif "run4bcd" in filename.lower():
+        detailed_run_period = "4bcd"
     elif "run5" in filename.lower():
         detailed_run_period = "5"
-    elif "run45" in filename.lower():
-        detailed_run_period = "45"
     else:
         raise ValueError("Invalid detailed run period!", filename)
 
@@ -198,7 +226,7 @@ def process_root_file(filename, frac_events = 1):
         progress_str += f" (f={frac_events})"
     print(progress_str)
 
-    return filetype, all_df, file_POT
+    return filetype, detailed_run_period, all_df, file_POT
 
 
 if __name__ == "__main__":
@@ -218,7 +246,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if args.memory_logger:
-        start_memory_logger(10)
+        start_memory_logger(1)
 
     if args.create_file_dfs:
         print("Creating file-level dataframes for each file...")
@@ -233,15 +261,6 @@ if __name__ == "__main__":
 
         print("Starting loop over root files...")
         all_df_pl = pl.DataFrame()
-        all_nc_pi0_POTs = []
-        all_numucc_pi0_POTs = []
-        all_nu_POTs = []
-        all_nue_POTs = []
-        all_dirt_POTs = []
-        all_ext_POTs = []
-        all_delete_one_gamma_POTs = []
-        all_isotropic_one_gamma_POTs = []
-        all_data_POTs = []
 
         filenames_with_unused = os.listdir(data_files_location)
         filenames_with_unused.sort()
@@ -256,37 +275,23 @@ if __name__ == "__main__":
             if "UNUSED" in filename or "older_downloads" in filename:
                 continue
 
+            if "nfs000000150070ba7d00000751" in filename: # TEMPORARY: weird file in directory now
+                continue
+
             if "detvar" in filename.lower():
                 continue
 
             filenames.append(filename)
 
+        pot_dic = {}
+
         for file_num, filename in enumerate(filenames):
 
             print(f"Processing file {file_num} / {len(filenames)}")
 
-            filetype, curr_df, curr_POT = process_root_file(filename, frac_events=args.frac_events)
-            if filetype == "nc_pi0_overlay":
-                all_nc_pi0_POTs.append(curr_POT)
-            elif filetype == "numucc_pi0_overlay":
-                all_numucc_pi0_POTs.append(curr_POT)
-            elif filetype == "nu_overlay":
-                all_nu_POTs.append(curr_POT)
-            elif filetype == "nue_overlay":
-                all_nue_POTs.append(curr_POT)
-            elif filetype == "dirt_overlay":
-                all_dirt_POTs.append(curr_POT)
-            elif filetype == "ext":
-                all_ext_POTs.append(curr_POT)
-            elif filetype == "delete_one_gamma_overlay":
-                all_delete_one_gamma_POTs.append(curr_POT)
-            elif filetype == "isotropic_one_gamma_overlay":
-                all_isotropic_one_gamma_POTs.append(curr_POT)
-            elif filetype == "data":
-                all_data_POTs.append(curr_POT)
-            else:
-                raise ValueError("Unknown filetype!", filetype)
+            filetype, detailed_run_period, curr_df, curr_POT = process_root_file(filename, frac_events=args.frac_events)
 
+            pot_dic[(filetype, detailed_run_period)] = curr_POT
 
             print("doing post-processing that requires vector variables...")
 
@@ -320,7 +325,6 @@ if __name__ == "__main__":
             curr_df_pl.write_parquet(parquet_path)
             print("saved to parquet file")
 
-            # Immediately reload the parquet shard to ensure on-disk integrity
             print(f"Reloading {parquet_path} to ensure on-disk integrity...")
             reloaded_df = pl.read_parquet(parquet_path)
             if "filetype" not in reloaded_df.columns:
@@ -337,24 +341,13 @@ if __name__ == "__main__":
 
                 # TODO: When we have more files, do weighting to make each set of run fractions match the run fractions in data
 
-        pot_dic = {
-            "nc_pi0_overlay": sum(all_nc_pi0_POTs),
-            "numucc_pi0_overlay": sum(all_numucc_pi0_POTs),
-            "nu_overlay": sum(all_nu_POTs),
-            "nue_overlay": sum(all_nue_POTs),
-            "dirt_overlay": sum(all_dirt_POTs),
-            "ext": sum(all_ext_POTs),
-            "delete_one_gamma_overlay": sum(all_delete_one_gamma_POTs),
-            "isotropic_one_gamma_overlay": sum(all_isotropic_one_gamma_POTs),
-            "data": sum(all_data_POTs),
-        }
 
         print("saving pot_dic to csv file...")
         if os.path.exists(f"{intermediate_files_location}/pot_dic.csv"):
             os.remove(f"{intermediate_files_location}/pot_dic.csv")
         with open(f"{intermediate_files_location}/pot_dic.csv", "w") as f:
             for key, value in pot_dic.items():
-                f.write(f"{key},{value}\n")
+                f.write(f"{key[0]},{key[1]},{value}\n")
 
         print("done creating file-level dataframes for each file")
 
@@ -365,8 +358,8 @@ if __name__ == "__main__":
         with open(f"{intermediate_files_location}/pot_dic.csv", "r") as f:
             pot_dic = {}
             for line in f:
-                key, value = line.strip().split(",")
-                pot_dic[key] = float(value)
+                filetype, detailed_run_period, value = line.strip().split(",")
+                pot_dic[(filetype, detailed_run_period)] = float(value)
 
         for file in os.listdir(intermediate_files_location):
             if file == "presel_df_train_vars.parquet" or file == "all_df.parquet":
@@ -375,20 +368,13 @@ if __name__ == "__main__":
 
         print("loading polars dataframes from parquet files...")
 
-        pl_dfs = []
-        for file in os.listdir(intermediate_files_location):
-            if file.startswith("curr_df_pl_") and file.endswith(".parquet"):
-                print(f"Reading {file}")
-                curr_df = pl.read_parquet(f"{intermediate_files_location}/{file}")
-                # Validate filetype column after reading from parquet - should never be empty
-                if 'filetype' in curr_df.columns:
-                    empty_count = curr_df.filter(pl.col("filetype") == '').height
-                    if empty_count > 0:
-                        raise ValueError(f"filetype column has {empty_count} empty string values after reading parquet file {file}. This should never happen!")
-                pl_dfs.append(curr_df)
-                print(f"Read {file}, estimated size: {pl_dfs[-1].estimated_size() / 1e9:.2f} GB")
-        all_df = pl.concat(align_columns_for_concat(pl_dfs), how="vertical")
-        del pl_dfs
+        parquet_files = sorted([
+            f"{intermediate_files_location}/{file}"
+            for file in os.listdir(intermediate_files_location)
+            if file.startswith("curr_df_pl_") and file.endswith(".parquet")
+        ])
+        print(f"Found {len(parquet_files)} parquet files")
+        all_df = pl.scan_parquet(parquet_files, missing_columns="insert", extra_columns="ignore").collect()
         print(f"all_df size: {all_df.estimated_size() / 1e9:.2f} GB")
         
         # Validate filetype column immediately after concatenation
@@ -407,31 +393,155 @@ if __name__ == "__main__":
         
         print(f"all_df.height={all_df.height}")
 
+        # Defrag immediately: scan_parquet over N files produces an N-chunk df and
+        # fragments the heap from many small allocations.  Write/reload once here
+        # so ALL downstream postprocessing (including add_signal_categories) runs on
+        # a fresh single-chunk df with a clean heap (~35 GB baseline instead of ~80 GB).
+        temp_defrag_path = f"{intermediate_files_location}/_temp_defrag_all_df.parquet"
+        print(f"Early defrag: writing {len(parquet_files)}-chunk df to {temp_defrag_path}...", end="", flush=True)
+        _t0 = time.time()
+        all_df.lazy().sink_parquet(temp_defrag_path)
+        del all_df
+        gc.collect()
+        try:
+            ctypes.CDLL("libc.so.6").malloc_trim(0)
+        except Exception:
+            pass
+        all_df = pl.read_parquet(temp_defrag_path)
+        os.remove(temp_defrag_path)
+        gc.collect()
+        print(f" done in {time.time() - _t0:.1f}s")
+
         print("doing post-processing that doesn't require vector variables using polars...")
 
         all_df = do_combined_postprocessing(all_df)
-        if pot_dic["data"] > 0:
-            normalizing_POT = pot_dic["data"]
-        else:
-            normalizing_POT = 1.11e21
-        
+
+        # Convert dtypes early so all subsequent postprocessing works on smaller arrays.
+        # Float64→Float32 and Int64→Int32 are done in batches to avoid holding two full
+        # copies of the dataframe at once.
+        print("Converting dtypes to reduce memory usage (before heavy postprocessing)...")
+        memory_before = all_df.estimated_size() / (1024**3)
+        print(f"Estimated memory usage before conversion: {memory_before:.4f} GB")
+
+        float64_cols = [col for col, dtype in all_df.schema.items() if dtype == pl.Float64]
+        int64_cols   = [col for col, dtype in all_df.schema.items() if dtype == pl.Int64]
+        print(f"Converting {len(float64_cols)} Float64 columns to Float32")
+        print(f"Converting {len(int64_cols)} Int64 columns to Int32 (clipping to Int32 range)")
+
+        if float64_cols:
+            all_df = all_df.with_columns([pl.col(col).cast(pl.Float32) for col in float64_cols])
+            gc.collect()
+
+        int32_min, int32_max = -2147483648, 2147483647
+        batch_size = 50
+        for i in range(0, len(int64_cols), batch_size):
+            batch = int64_cols[i:i + batch_size]
+            all_df = all_df.with_columns([
+                pl.col(col).clip(int32_min, int32_max).cast(pl.Int32) for col in batch
+            ])
+            gc.collect()
+
+        memory_after = all_df.estimated_size() / (1024**3)
+        print(f"Estimated memory usage after conversion: {memory_after:.4f} GB")
+        print(f"Memory saved: {memory_before - memory_after:.4f} GB ({(memory_before - memory_after) / memory_before * 100:.1f}%)")
+        gc.collect()
+
+        normalizing_POT = 0
+        for key, value in pot_dic.items():
+            if key[0] == "data":
+                normalizing_POT += value
+        if normalizing_POT == 0:
+            normalizing_POT = 1.11e21 # if we don't use a data file, assume we want full runs 1-5 data
+
         all_df = do_orthogonalization_and_POT_weighting(all_df, pot_dic, normalizing_POT=normalizing_POT)
+
+        # do_orthogonalization_and_POT_weighting adds new Float64 weight columns; convert them now.
+        new_float64_cols = [col for col, dtype in all_df.schema.items() if dtype == pl.Float64]
+        if new_float64_cols:
+            print(f"Converting {len(new_float64_cols)} new Float64 columns added by postprocessing: {new_float64_cols}")
+            all_df = all_df.with_columns([pl.col(col).cast(pl.Float32) for col in new_float64_cols])
+            gc.collect()
+
         all_df = add_signal_categories(all_df)
+        gc.collect()
+        try:
+            ctypes.CDLL("libc.so.6").malloc_trim(0)
+            print("malloc_trim successful")
+        except Exception:
+            print("malloc_trim failed")
 
-        file_RSEs = []
-        for filetype, run, subrun, event in zip(all_df["filetype"].to_numpy(), all_df["run"].to_numpy(), all_df["subrun"].to_numpy(), all_df["event"].to_numpy()):
-            file_RSE = f"{filetype}_{run:06d}_{subrun:06d}_{event:06d}"
-            file_RSEs.append(file_RSE)
-        if not len(file_RSEs) == len(set(file_RSEs)):
-            # find the duplicates
-            duplicates = [file_RSE for file_RSE in file_RSEs if file_RSEs.count(file_RSE) > 1]
-            print(f"Found {len(duplicates)} duplicates, first 10: {duplicates[:10]}")
-            raise ValueError("Duplicate filetype/run/subrun/event!")
+        train_test_score_bytes = (
+            all_df.select(["filename", "run", "subrun", "event"])
+            .hash_rows(seed=0)
+            .to_numpy()
+            & np.uint64(0xFF)
+        ).astype(np.uint8)
+        train_test_score = train_test_score_bytes.astype(np.float32) / 256.0
+        train_mask = train_test_score < 0.5
+        all_df = all_df.with_columns(
+            pl.Series("train_test_score", train_test_score),
+            pl.Series("will_use_for_50_50_training", train_mask),
+        )
 
+        print(f"Total number of events in all_df: {all_df.height}")
+        print(f"Number of events in all_df with will_use_for_50_50_training == True: {all_df.select(pl.col('will_use_for_50_50_training').sum()).item()}")
+
+        # Write all_df (with signal categories + train_test_score) to a temp parquet
+        # so that add_1g1mu_rad_corr_events and add_nc_coh_1g_reweighted_events can
+        # use scan_parquet with predicate pushdown to collect only the small filtered
+        # sub-dfs cheaply, then read the full df fresh from disk.
+        temp_defrag_path = f"{intermediate_files_location}/_temp_defrag_all_df.parquet"
+        print(f"Writing temp parquet to {temp_defrag_path}...", end="", flush=True)
+        start_time = time.time()
+        all_df.lazy().sink_parquet(temp_defrag_path)
+        del all_df
+        gc.collect()
+        try:
+            ctypes.CDLL("libc.so.6").malloc_trim(0)
+            print("malloc_trim successful")
+        except Exception:
+            print("malloc_trim failed")
+            pass
+        # Use scan_parquet (lazy) to compute the two small filtered sub-dfs with
+        # predicate pushdown (reads only the relevant rows, not the full 35 GB).
+        # Both add_* functions, when given a LazyFrame, collect and return only
+        # the *new* rows to append as a small eager DataFrame.
+        # After both small dfs are collected we read the full df once and concat.
+        # Temp file is kept until after read_parquet then removed.
+        print(f" done in {time.time() - start_time:.1f}s")
+        all_lf = pl.scan_parquet(temp_defrag_path)
+
+        rad_corrected_df = add_1g1mu_rad_corr_events(all_lf)
+        coherent_1g_df = add_nc_coh_1g_reweighted_events(all_lf)
+        del all_lf
+
+        print("Reading full df from parquet...")
+        start_read = time.time()
+        all_df = pl.read_parquet(temp_defrag_path)
+        os.remove(temp_defrag_path)
+        gc.collect()
+        print(f"  read done in {time.time() - start_read:.1f}s, all_df has {all_df.height} rows")
+
+        print("Concatenating full df with new rows...")
+        all_df = pl.concat([all_df, rad_corrected_df, coherent_1g_df], how="diagonal_relaxed")
+        del rad_corrected_df, coherent_1g_df
+        gc.collect()
+        print(f"  all_df has {all_df.height} rows after adding rad_corr and coherent events")
+
+        dup_mask = pl.struct("filetype", "run", "subrun", "event").is_duplicated()
+        n_dups = all_df.select(dup_mask.sum()).item()
+        if n_dups > 0:
+            dups = all_df.filter(dup_mask).select(["filename", "filetype", "run", "subrun", "event", "wc_truth_nuEnergy"])
+            print(f"Found {n_dups} duplicate rows, first 10:\n{dups.head(10)}")
+            raise ValueError("Duplicate filename/run/subrun/event!")
+
+        # Use sink_parquet via lazy API to stream the filtered data directly to disk
+        # without materializing a second full copy of all_df in memory.
         print(f"saving {intermediate_files_location}/presel_df_train_vars.parquet...", end="", flush=True)
         start_time = time.time()
-        presel_df = all_df.filter(pl.col("wc_kine_reco_Enu") > 0)
-        presel_df.write_parquet(f"{intermediate_files_location}/presel_df_train_vars.parquet")
+        all_df.lazy().filter(pl.col("wc_kine_reco_Enu") > 0).sink_parquet(
+            f"{intermediate_files_location}/presel_df_train_vars.parquet"
+        )
         end_time = time.time()
         file_size_gb = os.path.getsize(f"{intermediate_files_location}/presel_df_train_vars.parquet") / 1024**3
         print(f"done, {file_size_gb:.2f} GB, {end_time - start_time:.2f} seconds")

@@ -3,8 +3,8 @@ import os
 import hashlib
 from tqdm import tqdm
 import polars as pl
-from src.file_locations import intermediate_files_location, covariance_cache_location
-from src.df_helpers import get_vals
+from .file_locations import intermediate_files_location, covariance_cache_location
+from .df_helpers import get_vals
 
 from scipy.special import erfinv, erfcinv, erfc
 from scipy.stats import chi2
@@ -79,7 +79,7 @@ def get_pred_stat_cov(pred_vals, pred_weights, bins):
 
 
 def create_cov_matrix(unisim_hists, cv_hist, manual_uni_count=None):
-    # Similar to np.cov, but manually setting the number of univirses to divide by
+    # Similar to np.cov, but manually setting the number of universes to divide by
     # In some of the unisims, one of the universes is actually the CV. In these cases, 
     # we need to divide by the number of universes minus one.
     curr_cov = np.zeros((len(unisim_hists), len(unisim_hists)))
@@ -119,7 +119,7 @@ def create_universe_histograms(vals, bins, sys_weight_arrs, other_weights, descr
 
     # creating the histogram for each universe (with pre-computed bin indices)
     hists = np.zeros((num_bins, num_unis))
-    for uni_i, uni_weights in tqdm(enumerate(sys_weight_arrs.T), total=num_unis, desc=f"Creating {description} universe histograms", disable=quiet):
+    for uni_i, uni_weights in tqdm(enumerate(sys_weight_arrs.T), total=num_unis, desc=f"Creating {description} universe histograms", disable=quiet, mininterval=10):
         hists[:, uni_i] = np.bincount(bin_indices, weights=uni_weights*other_weights, minlength=num_bins)
 
     return hists
@@ -139,11 +139,23 @@ def create_rw_frac_cov_matrices(mc_pred_df, var, bins, weights_df=None):
         print("loading weights_df from parquet file...")
         weights_df = pl.read_parquet(f"{intermediate_files_location}/presel_weights_df.parquet")
 
+    derived_filetypes = ["numuCC_rad_corrected", "NC_coherent_1g_reweighted"]
+    if "filetype" in mc_pred_df.columns:
+        derived_counts = mc_pred_df.filter(pl.col("filetype").is_in(derived_filetypes)).group_by("filetype").agg(pl.len().alias("count"))
+        for row in derived_counts.iter_rows(named=True):
+            print(f"WARNING: {row['count']} events with filetype='{row['filetype']}' are present in mc_pred_df. "
+                  "These events have no flux, cross-section, or re-interaction systematics available,"
+                  " so they are assigned unit weights for all reweightable systematics.")
+
     print("merging mc_pred_df and weights_df...")
     pred_vars = ["filename", "run", "subrun", "event", "wc_net_weight", "wc_weight_cv", "wc_weight_spline", var]
     merged_df = mc_pred_df.select(pred_vars).join(weights_df, on=["filename", "run", "subrun", "event"], how="inner")
     if merged_df.height != mc_pred_df.height:
-        print(f"WARNING: missing events in weights_df, approximate reweightable systematic uncertainties! {mc_pred_df.height=}, {weights_df.height=}")
+        print(f"WARNING: missing events in weights_df, approximate reweightable systematic uncertainties! {merged_df.height=}, {mc_pred_df.height=}")
+        debug_cols = [c for c in ["filename", "filetype", "run", "subrun", "event"] if c in mc_pred_df.columns]
+        missing_df = mc_pred_df.select(debug_cols).join(weights_df.select(["filename", "run", "subrun", "event"]), on=["filename", "run", "subrun", "event"], how="anti").sample(10)
+        print(f"Randomly sampled 10 missing events:\n{missing_df.head(10)}")
+
 
     pred_vals = get_vals(merged_df, var)
 
@@ -161,15 +173,18 @@ def create_rw_frac_cov_matrices(mc_pred_df, var, bins, weights_df=None):
 
     All_UBGenie_hists = create_universe_histograms(pred_vals, bins, merged_df.get_column("All_UBGenie").to_numpy(), non_genie_cv_weights, description="All_UBGenie")
     All_UBGenie_cov = create_cov_matrix(All_UBGenie_hists, cv_hist)
-    rw_sys_frac_cov_dic["All_UBGenie"] = np.nan_to_num(All_UBGenie_cov / np.outer(cv_hist, cv_hist), nan=0, posinf=0, neginf=0)
+    denom = np.outer(cv_hist, cv_hist)
+    rw_sys_frac_cov_dic["All_UBGenie"] = np.nan_to_num(np.divide(All_UBGenie_cov, denom, out=np.zeros_like(All_UBGenie_cov), where=(denom != 0)), nan=0, posinf=0, neginf=0)
 
     flux_hists = create_universe_histograms(pred_vals, bins, merged_df.get_column("flux_all").to_numpy(), normal_weights, description="flux")
     flux_cov = create_cov_matrix(flux_hists, cv_hist)
-    rw_sys_frac_cov_dic["flux"] = np.nan_to_num(flux_cov / np.outer(cv_hist, cv_hist), nan=0, posinf=0, neginf=0)
+    denom = np.outer(cv_hist, cv_hist)
+    rw_sys_frac_cov_dic["flux"] = np.nan_to_num(np.divide(flux_cov, denom, out=np.zeros_like(flux_cov), where=(denom != 0)), nan=0, posinf=0, neginf=0)
 
     reint_hists = create_universe_histograms(pred_vals, bins, merged_df.get_column("reint_all").to_numpy(), normal_weights, description="reinteraction")
     reint_cov = create_cov_matrix(reint_hists, cv_hist)
-    rw_sys_frac_cov_dic["reinteraction"] = np.nan_to_num(reint_cov / np.outer(cv_hist, cv_hist), nan=0, posinf=0, neginf=0)
+    denom = np.outer(cv_hist, cv_hist)
+    rw_sys_frac_cov_dic["reinteraction"] = np.nan_to_num(np.divide(reint_cov, denom, out=np.zeros_like(reint_cov), where=(denom != 0)), nan=0, posinf=0, neginf=0)
 
     print("creating GENIE unisim systematic covariance matrices...")
 
@@ -201,14 +216,15 @@ def create_rw_frac_cov_matrices(mc_pred_df, var, bins, weights_df=None):
 
         unisim_hists = create_universe_histograms(pred_vals, bins, merged_df.get_column(unisim_type).to_numpy(), other_weights, description=unisim_type, quiet=True)
         unisim_cov = create_cov_matrix(unisim_hists, cv_hist, manual_uni_count=num_unis)
-        rw_sys_frac_cov_dic[unisim_type] = np.nan_to_num(unisim_cov / np.outer(cv_hist, cv_hist), nan=0, posinf=0, neginf=0)
+        denom = np.outer(cv_hist, cv_hist)
+        rw_sys_frac_cov_dic[unisim_type] = np.nan_to_num(np.divide(unisim_cov, denom, out=np.zeros_like(unisim_cov), where=(denom != 0)), nan=0, posinf=0, neginf=0)
 
     print("done getting reweightable systematic covariance matrices")
 
     return rw_sys_frac_cov_dic
 
 
-def create_detvar_frac_cov_matrices(detvar_df, var, bins, use_detvar_bootstrapping):
+def create_detvar_frac_cov_matrices(detvar_df, var, bins, use_detvar_bootstrapping, num_bootstrap_rounds_detvar=5000, num_bootstrap_samples_detvar=5000):
 
     print("creating detvar systematic covariance matrices...")
 
@@ -229,7 +245,8 @@ def create_detvar_frac_cov_matrices(detvar_df, var, bins, use_detvar_bootstrappi
             matching_var_counts = np.histogram(get_vals(matching_curr_df, var), weights=matching_curr_df.get_column("wc_net_weight").to_numpy(), bins=bins)[0]
             diff = matching_cv_counts - matching_var_counts
             curr_cov = np.outer(diff, diff)
-            curr_frac_cov = curr_cov / np.outer(matching_cv_counts, matching_cv_counts)
+            denom = np.outer(matching_cv_counts, matching_cv_counts)
+            curr_frac_cov = np.divide(curr_cov, denom, out=np.zeros_like(curr_cov), where=(denom != 0))
             curr_frac_cov = np.nan_to_num(curr_frac_cov, nan=0, posinf=0, neginf=0)
         else:
             # bootstrapping to estimate the statistical uncertainty on the CV-var difference
@@ -248,12 +265,9 @@ def create_detvar_frac_cov_matrices(detvar_df, var, bins, use_detvar_bootstrappi
             cv_val_weight_pairs = list(zip(matching_cv_vals, matching_cv_weights))
             var_val_weight_pairs = list(zip(matching_var_vals, matching_var_weights))
 
-            num_bootstrap_rounds = 5000
-            num_bootstrap_samples = 5000
-
             # sampling the CV and var spectra with replacement to get statistically plausible CV-var differences
             bootstrap_cv_var_diffs = [] # each row is a spectrum difference between CV and var for each bootstrap sample, each column is a sample
-            for bootstrap_i in tqdm(range(num_bootstrap_rounds), desc=f"Bootstrapping {vartype} detvar systematic covariance matrices"):
+            for bootstrap_i in tqdm(range(num_bootstrap_rounds_detvar), desc=f"Bootstrapping {vartype} detvar systematic covariance matrices", mininterval=10):
                 
                 bootstrap_cv_indices = np.random.choice(len(matching_cv_vals), size=len(matching_cv_vals), replace=True)
                 bootstrap_cv_vals = matching_cv_vals[bootstrap_cv_indices]
@@ -271,7 +285,7 @@ def create_detvar_frac_cov_matrices(detvar_df, var, bins, use_detvar_bootstrappi
             bootstrap_cv_var_diff_cov = np.cov(bootstrap_cv_var_diffs, rowvar=False)
 
             # drawing samples from the bootstrap_cv_var_diff_cov covariance matrix, each called V_D in the note
-            bootstrap_cv_var_diff_samples = np.random.multivariate_normal(nominal_cv_var_diff, bootstrap_cv_var_diff_cov, size=num_bootstrap_samples)
+            bootstrap_cv_var_diff_samples = np.random.multivariate_normal(nominal_cv_var_diff, bootstrap_cv_var_diff_cov, size=num_bootstrap_samples_detvar)
 
             normal_distribution_samples = np.random.normal(0, 1, size=len(bootstrap_cv_var_diff_samples))
 
@@ -281,7 +295,8 @@ def create_detvar_frac_cov_matrices(detvar_df, var, bins, use_detvar_bootstrappi
             # called M_D in the note
             curr_cov = np.cov(bootstrap_scaled_cv_var_diff_samples, rowvar=False)
 
-            curr_frac_cov = curr_cov / np.outer(matching_cv_counts, matching_cv_counts)
+            denom = np.outer(matching_cv_counts, matching_cv_counts)
+            curr_frac_cov = np.divide(curr_cov, denom, out=np.zeros_like(curr_cov), where=(denom != 0))
             curr_frac_cov = np.nan_to_num(curr_frac_cov, nan=0, posinf=0, neginf=0)
 
         detvar_sys_frac_cov_dic[vartype] = curr_frac_cov
@@ -300,7 +315,7 @@ def _key_hash(sel, var, bins):
     h.update(bins_arr.tobytes())
     return h.hexdigest()
 
-def _key_hash_detvar(sel, var, bins, use_detvar_bootstrapping):
+def _key_hash_detvar(sel, var, bins, use_detvar_bootstrapping, num_bootstrap_rounds_detvar, num_bootstrap_samples_detvar):
     bins_arr = np.asarray(bins, dtype=float)
     h = hashlib.sha256()
     h.update(sel.encode("utf-8"))
@@ -308,6 +323,10 @@ def _key_hash_detvar(sel, var, bins, use_detvar_bootstrapping):
     h.update(var.encode("utf-8"))
     h.update(b"\x00")
     h.update(str(use_detvar_bootstrapping).encode("utf-8"))
+    h.update(b"\x00")
+    h.update(str(num_bootstrap_rounds_detvar).encode("utf-8"))
+    h.update(b"\x00")
+    h.update(str(num_bootstrap_samples_detvar).encode("utf-8"))
     h.update(bins_arr.tobytes())
     return h.hexdigest()
 
@@ -330,20 +349,20 @@ def get_rw_sys_frac_cov_matrices(mc_pred_df, selname, var, bins, dont_load_rw_fr
     return rw_sys_frac_cov_dic
 
 
-def get_detvar_sys_frac_cov_matrices(detvar_df, selname, var, bins, dont_load_detvar_from_systematic_cache=False, use_detvar_bootstrapping=True):
+def get_detvar_sys_frac_cov_matrices(detvar_df, selname, var, bins, dont_load_detvar_from_systematic_cache=False, use_detvar_bootstrapping=True, num_bootstrap_rounds_detvar=5000, num_bootstrap_samples_detvar=5000):
     # detvar_df is not optional, it must be loaded by the user and must have the selection cuts applied to match those on mc_pred_df
 
     if not dont_load_detvar_from_systematic_cache:
-        key_h = _key_hash_detvar(selname, var, bins, use_detvar_bootstrapping)
+        key_h = _key_hash_detvar(selname, var, bins, use_detvar_bootstrapping, num_bootstrap_rounds_detvar, num_bootstrap_samples_detvar)
         cache_path = f"{covariance_cache_location}/detvar_cov_{key_h}.npz"
         if os.path.exists(cache_path):
             print("loading DetVar systematic covariance matrices from cache...")
             with np.load(cache_path, allow_pickle=True) as data:
                 return data["detvar_sys_frac_cov_dic"].item()
 
-    detvar_sys_frac_cov_dic = create_detvar_frac_cov_matrices(detvar_df, var, bins, use_detvar_bootstrapping)
+    detvar_sys_frac_cov_dic = create_detvar_frac_cov_matrices(detvar_df, var, bins, use_detvar_bootstrapping, num_bootstrap_rounds_detvar=num_bootstrap_rounds_detvar, num_bootstrap_samples_detvar=num_bootstrap_samples_detvar)
 
-    key_h = _key_hash_detvar(selname, var, bins, use_detvar_bootstrapping)
+    key_h = _key_hash_detvar(selname, var, bins, use_detvar_bootstrapping, num_bootstrap_rounds_detvar, num_bootstrap_samples_detvar)
     cache_path = f"{covariance_cache_location}/detvar_cov_{key_h}.npz"
     np.savez_compressed(cache_path, detvar_sys_frac_cov_dic=detvar_sys_frac_cov_dic)
 

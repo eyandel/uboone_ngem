@@ -10,10 +10,6 @@ blip_vars = [
     "blip_true_g4id",
     "blip_true_pdg",
     "blip_true_energy",
-]
-
-# more technical blip variables
-extra_blip_vars = [
     "blip_charge",
     "blip_nplanes",
     "blip_proxtrkdist",
@@ -280,13 +276,13 @@ pandora_scalar_vars = [
     "slcng2hip",
     "slcng2mcl",
     "slcng2dfs",
-    "slcng2bkg",
+    #"slcng2bkg", # removing bkg variables, advice from Giuseppe, https://microboone.slack.com/archives/C04PSEK91FZ/p1765482781972259
     "clung2shr",
     "clung2mip",
     "clung2hip",
     "clung2mcl",
     "clung2dfs",
-    "clung2bkg",
+    #"clung2bkg",
 ]
 
 pandora_vector_vars = [
@@ -303,30 +299,32 @@ pandora_vector_vars = [
     "pfng2hipfrac",
     "pfng2mclfrac",
     "pfng2dfsfrac",
-    "pfng2bkgfrac",
+    # removing bkg variables, advice from Giuseppe, https://microboone.slack.com/archives/C04PSEK91FZ/p1765482781972259
+    #"pfng2bkgfrac",
     "pfng2shravrg",
     "pfng2mipavrg",
     "pfng2hipavrg",
     "pfng2mclavrg",
     "pfng2dfsavrg",
-    "pfng2bkgavrg",
+    #"pfng2bkgavrg",
     "trk_pfp_id_v",
     "trk_phi_v",
-    "trk_pid_chika_u_v",
-    "trk_pid_chika_v",
-    "trk_pid_chika_v_v",
-    "trk_pid_chimu_u_v",
-    "trk_pid_chimu_v",
-    "trk_pid_chimu_v_v",
-    "trk_pid_chipi_u_v",
-    "trk_pid_chipi_v",
-    "trk_pid_chipi_v_v",
-    "trk_pid_chipr_u_v",
-    "trk_pid_chipr_v",
-    "trk_pid_chipr_v_v",
-    "trk_pida_u_v",
-    "trk_pida_v",
-    "trk_pida_v_v",
+    # removing chi variables, advice from Giuseppe, https://microboone.slack.com/archives/C04PSEK91FZ/p1765482781972259
+    #"trk_pid_chika_u_v",
+    #"trk_pid_chika_v",
+    #"trk_pid_chika_v_v",
+    #"trk_pid_chimu_u_v",
+    #"trk_pid_chimu_v",
+    #"trk_pid_chimu_v_v",
+    #"trk_pid_chipi_u_v",
+    #"trk_pid_chipi_v",
+    #"trk_pid_chipi_v_v",
+    #"trk_pid_chipr_u_v",
+    #"trk_pid_chipr_v",
+    #"trk_pid_chipr_v_v",
+    #"trk_pida_u_v",
+    #"trk_pida_v",
+    #"trk_pida_v_v",
     # "trkshrscore_v", # seems to be usually an empty list, and then occasionally [0], with no nonzero values
     "trk_llr_pid_score_v",
     "trk_len_v",
@@ -342,12 +340,12 @@ pandora_vector_vars_with_prefix = [f"pandora_{var}" for var in pandora_vector_va
 pandora_vars = pandora_non_BDT_vars + pandora_scalar_vars + pandora_vector_vars
 
 pandora_postprocessing_vars = []
+for var in pandora_vector_vars:
+    pandora_postprocessing_vars.append(f"pandora_max3_len_trk_{var}")
+    pandora_postprocessing_vars.append(f"pandora_max2_len_trk_{var}")
+    pandora_postprocessing_vars.append(f"pandora_max_len_trk_{var}")
 
 pandora_training_vars = [f"pandora_{var}" for var in pandora_scalar_vars] + pandora_postprocessing_vars
 
 pandora_scalar_training_vars = [f"pandora_{var}" for var in pandora_scalar_vars]
 pandora_vector_training_vars = [f"pandora_{var}" for var in pandora_vector_vars]
-
-pandora_scalar_first_half_training_vars = pandora_scalar_training_vars[:len(pandora_scalar_training_vars)//2]
-pandora_scalar_second_half_training_vars = pandora_scalar_training_vars[len(pandora_scalar_training_vars)//2:]
-

@@ -38,6 +38,18 @@ vector_columns = [
     "blip_true_g4id",
     "blip_true_pdg",
     "blip_true_energy",
+    "blip_charge",
+    "blip_nplanes",
+    "blip_proxtrkdist",
+    "blip_proxtrkid",
+    "blip_touchtrk",
+    "blip_touchtrkid",
+    "blip_pl0_nwires",
+    "blip_pl1_nwires",
+    "blip_pl2_nwires",
+    "blip_pl0_bydeadwire",
+    "blip_pl1_bydeadwire",
+    "blip_pl2_bydeadwire",
 
     "glee_sss_candidate_veto_score",
     "glee_sss3d_shower_score",
@@ -185,3 +197,13 @@ duplicate_bdt_vars = [
 ]
 
 combined_training_vars = [var for var in combined_training_vars_with_duplicates if var not in duplicate_bdt_vars]
+
+# pandora MCS has some known issues
+not_using_for_training_vars = ["pandora_trk_energy_muon_mcs"] # pandora MCS has some known issues
+
+# nugraph hit fractions see some data/pred disagreement, better to use pfng2semlabel for these
+not_using_for_training_vars += ["pandora_max_len_trk_pfng2shrfrac", "pandora_max_len_trk_pfng2mipfrac", "pandora_max_len_trk_pfng2hipfrac", "pandora_max_len_trk_pfng2mclfrac", "pandora_max_len_trk_pfng2dfsfrac"]
+not_using_for_training_vars += ["pandora_max2_len_trk_pfng2shrfrac", "pandora_max2_len_trk_pfng2mipfrac", "pandora_max2_len_trk_pfng2hipfrac", "pandora_max2_len_trk_pfng2mclfrac", "pandora_max2_len_trk_pfng2dfsfrac"]
+not_using_for_training_vars += ["pandora_max3_len_trk_pfng2shrfrac", "pandora_max3_len_trk_pfng2mipfrac", "pandora_max3_len_trk_pfng2hipfrac", "pandora_max3_len_trk_pfng2mclfrac", "pandora_max3_len_trk_pfng2dfsfrac"]
+
+combined_training_vars = [var for var in combined_training_vars if var not in not_using_for_training_vars]

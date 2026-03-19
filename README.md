@@ -1,5 +1,7 @@
 # MicroBooNE Next-Gen Electromagnetic Shower Search (NGEM)
 
+Some overview slides are available on the MicroBooNE DocDB [here](https://microboone-docdb.fnal.gov/cgi-bin/sso/ShowDocument?docid=46041).
+
 
 ## Downloading Input Files
 ```
@@ -31,7 +33,7 @@ This takes a bit of time, might want to run it in the background with nohup or t
 
 ```
 python src/create_df.py -f 0.01 --create_file_dfs
-python src/create_df.py -f 0.01 --merge_file_dfs
+python src/create_df.py --merge_file_dfs
 
 nohup python -u src/create_df.py -m --create_file_dfs > create_file_dfs_nohup.out 2>&1 &
 nohup python -u src/create_df.py -m --merge_file_dfs > merge_file_dfs_nohup.out 2>&1 &
@@ -56,6 +58,23 @@ nohup python -u src/create_detvar_df.py -m > detvar_nohup.out 2>&1 &
 ```
 nohup python -u src/train.py --name all_vars > train_nohup.out 2>&1 &
 
+nohup python -u src/train.py --name nc_coh_1g_vs_bkg --signal_categories nc_coh_1g_vs_bkg > nc_coh_1g_vs_bkg_train_nohup.out 2>&1 &
+
 python src/train.py --name all_vars_small
+
+# hyperparameter tuning
+nohup python -u src/hyperparameter_tuning.py --study_name first_test_xgb_hp --n_trials 10 > hyperparameter_tuning_nohup.out 2>&1 &
+```
+
+## Creating Many Plots
+
+```
+python src/plot_many_variables.py --num_plots 3
+
+nohup python -u src/plot_many_variables.py > many_plots_nohup.out 2>&1 &
+
+nohup python -u src/plot_many_detvar_variables.py --clear-prev > many_detvar_plots_nohup.out 2>&1 &
+
+# Sometimes polars causes segfaults? Can check using dmesg.
 ```
 

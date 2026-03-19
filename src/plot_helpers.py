@@ -4,15 +4,16 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle
 import matplotlib.gridspec as gridspec
 
-from src.signal_categories import del1g_detailed_category_labels, del1g_detailed_category_labels_latex, del1g_detailed_category_colors, del1g_detailed_category_hatches
-from src.signal_categories import filetype_category_labels, filetype_category_colors, filetype_category_hatches
-
-from src.systematics import get_rw_sys_frac_cov_matrices, get_detvar_sys_frac_cov_matrices, get_data_stat_cov, get_pred_stat_cov
-from src.systematics import get_significance, get_significance_from_p_value, chi2_decomposition
-
-from src.df_helpers import get_vals
-
-from src.file_locations import intermediate_files_location
+from .signal_categories import del1g_detailed_category_labels, del1g_detailed_category_labels_latex, del1g_detailed_category_colors, del1g_detailed_category_hatches, del1g_detailed_category_queries
+from .signal_categories import filetype_category_labels, filetype_category_colors, filetype_category_hatches
+from .signal_categories import erin_category_labels, erin_category_labels_latex, erin_category_colors, erin_category_hatches, erin_category_queries
+from .signal_categories import erin_Np0p_category_labels, erin_Np0p_category_labels_latex, erin_Np0p_category_colors, erin_Np0p_category_hatches, erin_Np0p_category_queries
+from .signal_categories import erin_Np0pNn0n_category_labels, erin_Np0pNn0n_category_labels_latex, erin_Np0pNn0n_category_colors, erin_Np0pNn0n_category_hatches, erin_Np0pNn0n_category_queries
+from .signal_categories import erin_Np0pNn0n_pi0_category_labels, erin_Np0pNn0n_pi0_category_labels_latex, erin_Np0pNn0n_pi0_category_colors, erin_Np0pNn0n_pi0_category_hatches, erin_Np0pNn0n_pi0_category_queries
+from .systematics import get_rw_sys_frac_cov_matrices, get_detvar_sys_frac_cov_matrices, get_data_stat_cov, get_pred_stat_cov
+from .systematics import get_significance, get_significance_from_p_value, chi2_decomposition
+from .df_helpers import get_vals
+from .file_locations import intermediate_files_location
 
 
 def custom_step(bins, counts, ax=None, **kwargs):
@@ -64,12 +65,27 @@ def add_underflow_overflow(bins, display_bins, include_overflow, include_underfl
 
 def auto_binning(all_vals):
 
+    include_underflow = False
+    include_overflow = False
+    log_x = False
+
+    # Filter out NaN and infinite values
+    all_vals = all_vals[np.isfinite(all_vals)]
+    
+    if len(all_vals) == 0:
+        raise ValueError("all_vals contains no finite values after filtering NaN/inf")
+
+    if all_vals.dtype == bool:
+        all_vals = all_vals.astype(int)
+
+    all_vals = np.array(all_vals)
+
     min_val = np.min(all_vals)
     max_val = np.max(all_vals)
 
-    # calculate the 10% and 90% edges of all_vals
-    lower_common_edge = np.percentile(all_vals, 5)
-    upper_common_edge = np.percentile(all_vals, 95)
+    # calculate the 5% and 95% edges of all_vals
+    lower_common_edge = np.percentile(all_vals[(all_vals > -1e10) & (all_vals < 1e10)], 5)
+    upper_common_edge = np.percentile(all_vals[(all_vals > -1e10) & (all_vals < 1e10)], 95)
 
     if min_val != lower_common_edge:
         print("including underflow")
@@ -81,23 +97,26 @@ def auto_binning(all_vals):
     print(f"choosing bins automatically, min_val = {min_val:.4e}, max_val = {max_val:.4e}, lower_common_edge = {lower_common_edge:.4e}, upper_common_edge = {upper_common_edge:.4e}")
 
     # if min_val, lower_common_edge, max_val, upper_common_edge are all integers, then use integers for the bins
-    if min_val.is_integer() and lower_common_edge.is_integer() and max_val.is_integer() and upper_common_edge.is_integer():
-        print("choosing integer bins")
-        bins = np.arange(min_val, max_val + 1)
+    if (min_val.is_integer() and lower_common_edge.is_integer() and max_val.is_integer() and upper_common_edge.is_integer()
+                and -1e6 < lower_common_edge and upper_common_edge < 1e6 and upper_common_edge - lower_common_edge <= 30):
+        bins = np.arange(lower_common_edge, upper_common_edge + 2) - 0.5
+        print("choosing integer bins:", bins)
     elif len(np.unique(all_vals)) == 2:
-        print("choosing two bins")
         bins = np.array([min_val - 0.5, (min_val + max_val) / 2, max_val + 0.5])
+        print("choosing two bins: ", bins)
         include_overflow = False
         include_underflow = False
     elif 0 < lower_common_edge and 10_000 < upper_common_edge and np.log10(upper_common_edge) - np.log10(lower_common_edge) > 3:
-        print("choosing log bins:", bins)
         bins = np.logspace(np.log10(lower_common_edge) - 0.01, np.log10(upper_common_edge) + 0.01, 21)
+        print("choosing log bins:", bins)
         log_x = True
     else:
         width = upper_common_edge - lower_common_edge
         bins = np.linspace(lower_common_edge - 0.01, upper_common_edge + 0.01, 21)
         print("choosing linear bins:", bins)
 
+    # Initialize display_bins before calling add_underflow_overflow
+    display_bins = bins.copy()
     bins, display_bins = add_underflow_overflow(bins, display_bins, include_overflow, include_underflow, log_x)
 
     if not np.all(np.diff(bins) > 0):
@@ -141,13 +160,15 @@ def make_sys_frac_error_plot(tot_sys_frac_cov, tot_pred_sys_frac_cov, rw_sys_fra
             print(f"Total (no Data Stat): {np.sqrt(np.diag(tot_pred_sys_frac_cov))}")
     
     if include_pred_stat:
-        pred_stat_frac_cov = pred_stat_cov / np.outer(pred_counts, pred_counts)
+        denom = np.outer(pred_counts, pred_counts)
+        pred_stat_frac_cov = np.divide(pred_stat_cov, denom, out=np.zeros_like(pred_stat_cov), where=(denom != 0))
         pred_stat_frac_cov = np.nan_to_num(pred_stat_frac_cov, nan=0, posinf=0, neginf=0)
         custom_step(display_bins, np.sqrt(np.diag(pred_stat_frac_cov)), label="Pred Stat", ls="-")
         if print_sys_breakdown:
             print(f"Pred Stat: {np.sqrt(np.diag(pred_stat_frac_cov))}")
     if include_data_stat:
-        data_stat_frac_cov = data_stat_cov / np.outer(pred_counts, pred_counts)
+        denom = np.outer(pred_counts, pred_counts)
+        data_stat_frac_cov = np.divide(data_stat_cov, denom, out=np.zeros_like(data_stat_cov), where=(denom != 0))
         data_stat_frac_cov = np.nan_to_num(data_stat_frac_cov, nan=0, posinf=0, neginf=0)
         custom_step(display_bins, np.sqrt(np.diag(data_stat_frac_cov)), label="Data Stat", ls="-")
         if print_sys_breakdown:
@@ -157,7 +178,8 @@ def make_sys_frac_error_plot(tot_sys_frac_cov, tot_pred_sys_frac_cov, rw_sys_fra
         tot_genie_frac_cov = np.zeros((len(display_bins)-1, len(display_bins)-1))
         for rw_sys_name, rw_sys_frac_cov_mc in rw_sys_frac_cov_dic.items():
             rw_sys_cov = rw_sys_frac_cov_mc * np.outer(mc_pred_counts, mc_pred_counts) # fractional uncertainty on the MC pred, not including EXT
-            rw_sys_frac_cov = rw_sys_cov / np.outer(pred_counts, pred_counts)
+            denom = np.outer(pred_counts, pred_counts)
+            rw_sys_frac_cov = np.divide(rw_sys_cov, denom, out=np.zeros_like(rw_sys_cov), where=(denom != 0))
             rw_sys_frac_cov = np.nan_to_num(rw_sys_frac_cov, nan=0, posinf=0, neginf=0)
             if rw_sys_name in [
                     "All_UBGenie",
@@ -194,7 +216,8 @@ def make_sys_frac_error_plot(tot_sys_frac_cov, tot_pred_sys_frac_cov, rw_sys_fra
         tot_detvar_frac_cov = np.zeros((len(display_bins)-1, len(display_bins)-1))
         for detvar_sys_name, detvar_sys_frac_cov_mc in detvar_sys_frac_cov_dic.items():
             detvar_sys_cov = detvar_sys_frac_cov_mc * np.outer(mc_pred_counts, mc_pred_counts) # fractional uncertainty on the MC pred, not including EXT
-            detvar_sys_frac_cov = detvar_sys_cov / np.outer(pred_counts, pred_counts)
+            denom = np.outer(pred_counts, pred_counts)
+            detvar_sys_frac_cov = np.divide(detvar_sys_cov, denom, out=np.zeros_like(detvar_sys_cov), where=(denom != 0))
             detvar_sys_frac_cov = np.nan_to_num(detvar_sys_frac_cov, nan=0, posinf=0, neginf=0)
             tot_detvar_frac_cov += detvar_sys_frac_cov
             if not just_detvar_breakdown:
@@ -229,8 +252,8 @@ def make_sys_frac_error_plot(tot_sys_frac_cov, tot_pred_sys_frac_cov, rw_sys_fra
     if show: plt.show()
 
 
-def make_det_variation_histogram(var, display_var, bins, display_bins, display_bin_centers, include_overflow=True, include_underflow=False, log_x=False, log_y=False,
-        additional_scaling_factor=1.0, normalizing_POT=3.33e19, 
+def make_det_variation_histogram(var, display_var, bins, display_bins, display_bin_centers, log_x=False, log_y=False,
+        additional_scaling_factor=1.0, normalizing_POT=2.098e19+4.038e19, 
         page_num=None, savename=None, show=True, detvar_df=None):
 
 
@@ -239,13 +262,14 @@ def make_det_variation_histogram(var, display_var, bins, display_bins, display_b
     cv_df = detvar_df.filter(pl.col("vartype") == "CV")
 
     cv_counts = np.histogram(get_vals(cv_df, var), weights=cv_df.get_column("wc_net_weight").to_numpy()*additional_scaling_factor, bins=bins)[0]
+    min_nonzero_y = np.min(cv_counts[cv_counts > 0])
     max_y = np.max(cv_counts)
     ax1.hist(display_bin_centers, weights=cv_counts, bins=display_bins, histtype="step", color="k", lw=2, zorder=-1, label="CV")
 
     ratios_by_var_dic = {}
 
     total_cv_weight = np.sum(cv_df.get_column("wc_net_weight").to_numpy())
-    for vartype in ["LYAtt", "LYDown", "LYRayleigh", "WireModX", "Recomb2", "SCE"]:
+    for vartype in ["LYAtt", "LYDown", "LYRayleigh", "WireModX", "WireModYZ", "Recomb2", "SCE"]:
         curr_df = detvar_df.filter(pl.col("vartype") == vartype)
 
         curr_filetype_rse_df = curr_df.select(["filetype", "run", "subrun", "event"])
@@ -267,11 +291,12 @@ def make_det_variation_histogram(var, display_var, bins, display_bins, display_b
 
         ratios_by_var_dic[vartype] = var_over_cv_ratio
 
+        min_nonzero_y = min(min_nonzero_y, np.min(scaled_var_over_cv_ratio[scaled_var_over_cv_ratio > 0]))
         max_y = max(max_y, np.max(scaled_var_over_cv_ratio))
 
     ax1.set_xticklabels([])
 
-    for vartype in ["LYAtt", "LYDown", "LYRayleigh", "WireModX", "Recomb2", "SCE"]:
+    for vartype in ["LYAtt", "LYDown", "LYRayleigh", "WireModX", "WireModYZ", "Recomb2", "SCE"]:
         
         ratios = ratios_by_var_dic[vartype]
         custom_step(display_bins, ratios, ax=ax2, label=vartype)                
@@ -282,20 +307,24 @@ def make_det_variation_histogram(var, display_var, bins, display_bins, display_b
         ax2.set_xlabel(display_var)
         ax2.set_ylabel("Var/CV")
         ax2.set_xlim(display_bins[0], display_bins[-1])
-        ax2.set_ylim(0.5, 1.5)
+        #ax2.set_ylim(0.5, 1.5)
+        ax2.set_ylim(0.75, 1.25)
         if log_x:
             ax2.set_xscale("log")
 
-    ax1.set_ylabel(f"MC Pred counts (no EXT) (weighted\nto {additional_scaling_factor*normalizing_POT:.2e} POT)")
+    ax1.set_ylabel(f"MC Pred counts (no Dirt/EXT)")
     ax1.set_xlim(display_bins[0], display_bins[-1])
     if log_x:
         ax1.set_xscale("log")
     if log_y:
         ax1.set_yscale("log")
-        ax1.set_ylim(0.01, max_y * 10)
+        ax1.set_ylim(min_nonzero_y / 10, max_y * 10)
     else:
         ax1.set_ylim(0, max_y * 1.2)
     ax1.legend(ncol=1, loc='upper right', fontsize=12)
+
+    if page_num is not None:
+        ax2.text(-0.1, -0.3, f"{page_num}", transform=ax2.transAxes, fontsize=8, ha="left", va="bottom")
 
     if savename is not None:
         plt.savefig(f"../plots/{savename}_det_variation_histograms.pdf")
@@ -309,17 +338,21 @@ def make_histogram_plot(
         var=None, display_var=None, breakdown_type="del1g_detailed", 
         title=None, savename=None,
         iso1g_norm_factor=None, del1g_norm_factor=None, 
-        include_data=True, additional_scaling_factor=1.0, normalizing_POT=3.33e19, 
+        include_data=True, additional_scaling_factor=1.0, data_type="4a+4b open data",
         include_legend=True, show=True,
         page_num=None,
         include_ratio=True, include_decomposition=False,
+        legend_fontsize=6,
+        legend_ncol=2,
+        ylim=None,
+        yticks=None,
 
         # information for optional systematics
         selname=None,
         dont_load_rw_from_systematic_cache=False, dont_load_detvar_from_systematic_cache=False,
         use_rw_systematics=False, weights_df=None,
         use_detvar_systematics=False, detvar_df=None,
-        use_detvar_bootstrapping=True,
+        use_detvar_bootstrapping=True, num_bootstrap_rounds_detvar=5000, num_bootstrap_samples_detvar=5000,
         return_p_value_info=False,
 
         # optional detector variation histogram plot
@@ -383,9 +416,7 @@ def make_histogram_plot(
         breakdown_labels_latex = del1g_detailed_category_labels_latex
         breakdown_colors = del1g_detailed_category_colors
         breakdown_hatches = del1g_detailed_category_hatches
-        breakdown_queries = []
-        for label_i in range(len(breakdown_labels)):
-            breakdown_queries.append(pl.col("del1g_detailed_signal_category") == label_i)
+        breakdown_queries = del1g_detailed_category_queries
     elif breakdown_type == "filetype":
         breakdown_labels = filetype_category_labels
         breakdown_labels_latex = filetype_category_labels
@@ -394,12 +425,36 @@ def make_histogram_plot(
         breakdown_queries = []
         for label_i in range(len(breakdown_labels)):
             breakdown_queries.append(pl.col("filetype_signal_category") == label_i)
+    elif breakdown_type == "erin_categories":
+        breakdown_labels = erin_category_labels
+        breakdown_labels_latex = erin_category_labels_latex
+        breakdown_colors = erin_category_colors
+        breakdown_hatches = erin_category_hatches
+        breakdown_queries = erin_category_queries
+    elif breakdown_type == "erin_Np0p_categories":
+        breakdown_labels = erin_Np0p_category_labels
+        breakdown_labels_latex = erin_Np0p_category_labels_latex
+        breakdown_colors = erin_Np0p_category_colors
+        breakdown_hatches = erin_Np0p_category_hatches
+        breakdown_queries = erin_Np0p_category_queries
+    elif breakdown_type == "erin_Np0pNn0n_categories":
+        breakdown_labels = erin_Np0pNn0n_category_labels
+        breakdown_labels_latex = erin_Np0pNn0n_category_labels_latex
+        breakdown_colors = erin_Np0pNn0n_category_colors
+        breakdown_hatches = erin_Np0pNn0n_category_hatches
+        breakdown_queries = erin_Np0pNn0n_category_queries
+    elif breakdown_type == "erin_Np0pNn0n_pi0_categories":
+        breakdown_labels = erin_Np0pNn0n_pi0_category_labels
+        breakdown_labels_latex = erin_Np0pNn0n_pi0_category_labels_latex
+        breakdown_colors = erin_Np0pNn0n_pi0_category_colors
+        breakdown_hatches = erin_Np0pNn0n_pi0_category_hatches
+        breakdown_queries = erin_Np0pNn0n_pi0_category_queries
     else:
         raise ValueError(f"Invalid breakdown type: {breakdown_type}")
     breakdown_counts = []
     unweighted_breakdown_counts = []
     for breakdown_i, breakdown_label in enumerate(breakdown_labels):
-        curr_df = pred_sel_df.filter(breakdown_queries[breakdown_i])
+        curr_df = pred_sel_df.filter(eval(breakdown_queries[breakdown_i], {'pl': pl, '__builtins__': {}}))
         vals = get_vals(curr_df, var)
         breakdown_counts.append(np.histogram(vals, weights=curr_df.get_column("wc_net_weight").to_numpy()*additional_scaling_factor, bins=bins)[0])
         unweighted_breakdown_counts.append(np.histogram(vals, bins=bins)[0])
@@ -440,8 +495,20 @@ def make_histogram_plot(
         data_counts = np.histogram(get_vals(data_sel_df, var), bins=bins)[0]
         max_y = max(max_y, np.max(data_counts))
 
+        if data_type == "4a+4b open data":
+            data_pot = 2.098e19+4.038e19
+            data_label = f"{data_pot:.2e} POT Run 4a+4b Open Data ({np.sum(data_counts)})"
+        elif data_type == "4a open data":
+            data_pot = 2.098e19
+            data_label = f"{data_pot:.2e} POT Run 4a Open Data ({np.sum(data_counts)})"
+        elif data_type == "4b open data":
+            data_pot = 4.038e19
+            data_label = f"{data_pot:.2e} POT Run 4b Open Data ({np.sum(data_counts)})"
+        else:
+            raise ValueError(f"Invalid data type: {data_type}")
+
         ax1.errorbar(display_bin_centers, data_counts, yerr=np.sqrt(data_counts), fmt="o", color="k", lw=0.5, 
-                    capsize=2, capthick=1, markersize=2, label=f"3.33e19 POT Run 4b Data ({np.sum(data_counts)})")
+                    capsize=2, capthick=1, markersize=2, label=data_label)
 
         diff = data_counts - pred_counts
 
@@ -464,10 +531,11 @@ def make_histogram_plot(
         data_stat_cov = get_data_stat_cov(data_counts, pred_counts)
         pred_stat_cov = get_pred_stat_cov(get_vals(pred_sel_df, var), pred_sel_df.get_column("wc_net_weight").to_numpy(), bins)
         nodetvar_sys_cov = combined_rw_sys_cov + data_stat_cov + pred_stat_cov
-        nodetvar_sys_frac_cov = nodetvar_sys_cov / np.outer(pred_counts, pred_counts)
+        denom = np.outer(pred_counts, pred_counts)
+        nodetvar_sys_frac_cov = np.divide(nodetvar_sys_cov, denom, out=np.zeros_like(nodetvar_sys_cov), where=(denom != 0))
         nodetvar_sys_frac_cov = np.nan_to_num(nodetvar_sys_frac_cov, nan=0, posinf=0, neginf=0)
         nodetvar_pred_sys_cov = combined_rw_sys_cov + pred_stat_cov
-        nodetvar_pred_sys_frac_cov = nodetvar_pred_sys_cov / np.outer(pred_counts, pred_counts)
+        nodetvar_pred_sys_frac_cov = np.divide(nodetvar_pred_sys_cov, denom, out=np.zeros_like(nodetvar_pred_sys_cov), where=(denom != 0))
         nodetvar_pred_sys_frac_cov = np.nan_to_num(nodetvar_pred_sys_frac_cov, nan=0, posinf=0, neginf=0)
         nodetvar_pred_sys_frac_errors = np.sqrt(np.diag(nodetvar_pred_sys_frac_cov))
         for i in range(len(pred_counts)):
@@ -493,19 +561,20 @@ def make_histogram_plot(
                 raise ValueError("detvar_df must be provided if use_detvar_systematics is True")
 
             detvar_sys_frac_cov_dic = get_detvar_sys_frac_cov_matrices(
-                detvar_df, selname, var, bins, dont_load_detvar_from_systematic_cache=dont_load_detvar_from_systematic_cache, use_detvar_bootstrapping=use_detvar_bootstrapping
+                detvar_df, selname, var, bins, dont_load_detvar_from_systematic_cache=dont_load_detvar_from_systematic_cache, use_detvar_bootstrapping=use_detvar_bootstrapping, num_bootstrap_rounds_detvar=num_bootstrap_rounds_detvar, num_bootstrap_samples_detvar=num_bootstrap_samples_detvar
             )
             combined_detvar_sys_frac_cov_mc = np.zeros((len(bins)-1, len(bins)-1))
             for detvar_sys_frac_cov_name, detvar_sys_frac_cov in detvar_sys_frac_cov_dic.items():
                 combined_detvar_sys_frac_cov_mc += detvar_sys_frac_cov
             combined_detvar_sys_cov = combined_detvar_sys_frac_cov_mc * np.outer(mc_pred_counts, mc_pred_counts) # fractional uncertainty on the MC pred, not including EXT
-            combined_detvar_sys_frac_cov = combined_detvar_sys_cov / np.outer(pred_counts, pred_counts)
+            denom = np.outer(pred_counts, pred_counts)
+            combined_detvar_sys_frac_cov = np.divide(combined_detvar_sys_cov, denom, out=np.zeros_like(combined_detvar_sys_cov), where=(denom != 0))
             combined_detvar_sys_frac_cov = np.nan_to_num(combined_detvar_sys_frac_cov, nan=0, posinf=0, neginf=0)
             tot_sys_cov = combined_detvar_sys_cov + combined_rw_sys_cov + data_stat_cov + pred_stat_cov
-            tot_sys_frac_cov = tot_sys_cov / np.outer(pred_counts, pred_counts)
+            tot_sys_frac_cov = np.divide(tot_sys_cov, denom, out=np.zeros_like(tot_sys_cov), where=(denom != 0))
             tot_sys_frac_cov = np.nan_to_num(tot_sys_frac_cov, nan=0, posinf=0, neginf=0)
             tot_pred_sys_cov = combined_detvar_sys_cov + combined_rw_sys_cov + pred_stat_cov
-            tot_pred_sys_frac_cov = tot_pred_sys_cov / np.outer(pred_counts, pred_counts)
+            tot_pred_sys_frac_cov = np.divide(tot_pred_sys_cov, denom, out=np.zeros_like(tot_pred_sys_cov), where=(denom != 0))
             tot_pred_sys_frac_cov = np.nan_to_num(tot_pred_sys_frac_cov, nan=0, posinf=0, neginf=0)
             tot_pred_sys_frac_errors = np.sqrt(np.diag(tot_pred_sys_frac_cov))
 
@@ -552,6 +621,7 @@ def make_histogram_plot(
             s += f"No DetVar: $\chi^2/ndf$ = {nodetvar_chi2:.2f}/{ndf}, p = {nodetvar_p_value:.2e}, $\sigma$ = {nodetvar_sigma:.2f}"
 
             p_value_info_dic = {}
+            p_value_info_dic["var"] = var
             p_value_info_dic["nodetvar_chi2"] = nodetvar_chi2
             p_value_info_dic["nodetvar_p_value"] = nodetvar_p_value
             p_value_info_dic["nodetvar_sigma"] = nodetvar_sigma
@@ -590,9 +660,9 @@ def make_histogram_plot(
         display_var = var
     
     if additional_scaling_factor != 1.0:
-        ax1.set_ylabel(f"Counts (weighted\nto {additional_scaling_factor*normalizing_POT:.2e} POT)")
+        ax1.set_ylabel(f"Counts (weighted\nto {additional_scaling_factor*data_pot:.2e} POT)")
     else:
-        ax1.set_ylabel(f"Counts (weighted\nto {normalizing_POT:.2e} POT)")
+        ax1.set_ylabel(f"Counts (weighted\nto {data_pot:.2e} POT)")
     ax1.set_title(title)
     ax1.set_xlim(display_bins[0], display_bins[-1])
     if log_x:
@@ -602,8 +672,13 @@ def make_histogram_plot(
         ax1.set_ylim(0.01, max_y * 10)
     else:
         ax1.set_ylim(0, max_y * 1.2)
+
+    if ylim is not None:
+        ax1.set_ylim(ylim)
+    if yticks is not None:
+        ax1.set_yticks(yticks)
     if include_legend:
-        ax1.legend(ncol=2, loc='upper right', fontsize=6)
+        ax1.legend(ncol=legend_ncol, loc='upper right', fontsize=legend_fontsize)
     
     if include_ratio:
         ax1.set_xticklabels([])
@@ -663,14 +738,10 @@ def make_histogram_plot(
         if log_x:
             ax2.set_xscale("log")
 
-        if page_num is not None:
-            ax2.text(-0.1, -0.3, f"{page_num}", transform=ax2.transAxes, fontsize=8, ha="left", va="bottom")
     else:
         # Set x-axis label on main plot when ratio panel is not included
         ax1.set_xlabel(display_var)
         
-        if page_num is not None:
-            ax1.text(-0.1, -0.3, f"{page_num}", transform=ax1.transAxes, fontsize=8, ha="left", va="bottom")
 
     if include_decomposition:
 
@@ -723,6 +794,14 @@ def make_histogram_plot(
         p_value_info_dic["tot_global_p_value"] = tot_global_p_value
 
         ax3.text(0.03, 0.97, nodetvar_str + "\n" + tot_str, transform=ax3.transAxes, fontsize=8, ha="left", va="top")
+
+    if page_num is not None:
+        if include_ratio and not include_decomposition:
+            ax2.text(-0.1, -0.3, f"{page_num}", transform=ax2.transAxes, fontsize=8, ha="left", va="bottom")
+        elif include_decomposition:
+            ax3.text(-0.1, -0.3, f"{page_num}", transform=ax3.transAxes, fontsize=8, ha="left", va="bottom")
+        else:
+            ax1.text(-0.1, -0.3, f"{page_num}", transform=ax1.transAxes, fontsize=8, ha="left", va="bottom")
     
     
     if savename is not None:
@@ -732,7 +811,9 @@ def make_histogram_plot(
     if show: plt.show()
 
     if plot_det_variations:
-        make_det_variation_histogram(var, display_var, bins, display_bins, display_bin_centers, include_overflow, include_underflow, log_x, log_y, additional_scaling_factor, normalizing_POT, page_num, savename, show, detvar_df)
+        make_det_variation_histogram(var, display_var, bins, display_bins, display_bin_centers, log_x, log_y, 
+        additional_scaling_factor, data_pot, 
+        page_num, savename, show, detvar_df)
 
 
     if plot_sys_breakdown:
@@ -741,7 +822,10 @@ def make_histogram_plot(
         
         make_sys_frac_error_plot(tot_sys_frac_cov, tot_pred_sys_frac_cov, rw_sys_frac_cov_dic, detvar_sys_frac_cov_dic, pred_stat_cov, data_stat_cov, 
             mc_pred_counts, pred_counts, display_var, display_bins, log_x, savename, show, 
-            include_total, include_pred_stat, include_data_stat, include_rw, just_genie_breakdown, include_detvar, just_detvar_breakdown, print_sys_breakdown)
+            include_total, include_pred_stat, include_data_stat, 
+            include_rw, just_genie_breakdown, 
+            include_detvar, just_detvar_breakdown, detvar_df, 
+            print_sys_breakdown)
 
     if return_p_value_info:
         return p_value_info_dic

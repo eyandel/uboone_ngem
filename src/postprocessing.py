@@ -1,28 +1,210 @@
+import gc
 import numpy as np
 import pandas as pd
 import polars as pl
 from tqdm import tqdm
 import warnings
+import copy
 
 from collections import defaultdict
 
-from ntuple_variables.variables import pandora_vector_vars_with_prefix, vector_columns
+from ntuple_variables.variables import pandora_vector_vars, pandora_vector_vars_with_prefix, vector_columns
 from signal_categories import topological_category_queries, topological_category_labels
 from signal_categories import del1g_detailed_category_queries, del1g_detailed_category_labels
 from signal_categories import del1g_simple_category_queries, del1g_simple_category_labels
 from signal_categories import filetype_category_queries, filetype_category_labels
+from signal_categories import erin_category_queries, erin_category_labels
+
+from file_locations import intermediate_files_location
+
+def change_dtypes(df):
+    """
+    Convert Float64 to Float32 and Int64 to Int32 to reduce memory usage.
+    Clips Int64 values to Int32 range before conversion.
+    """
+    print("Converting dtypes to reduce memory usage...")
+    memory_before = df.estimated_size() / (1024**3)
+    print(f"Estimated memory usage before conversion: {memory_before:.4f} GB")
+    print()
+
+    # Get columns to convert
+    float64_cols = [col for col, dtype in df.schema.items() if dtype == pl.Float64]
+    int64_cols = [col for col, dtype in df.schema.items() if dtype == pl.Int64]
+
+    print(f"Converting {len(float64_cols)} Float64 columns to Float32")
+    print(f"Converting {len(int64_cols)} Int64 columns to Int32 (clipping values to Int32 range)")
+
+    # Convert Float64 to Float32
+    if float64_cols:
+        df = df.with_columns([pl.col(col).cast(pl.Float32) for col in float64_cols])
+        gc.collect()
+
+    # Convert Int64 to Int32, clipping values to Int32 range
+    # Int32 range: -2,147,483,648 to 2,147,483,647
+    int32_min = -2147483648
+    int32_max = 2147483647
+
+    if int64_cols:
+        # Clip values to Int32 range, then cast to Int32 in batches to limit peak memory
+        print(f"Converting {len(int64_cols)} Int64 columns to Int32")
+        batch_size = 50
+        for i in range(0, len(int64_cols), batch_size):
+            batch = int64_cols[i:i + batch_size]
+            df = df.with_columns([
+                pl.col(col).clip(int32_min, int32_max).cast(pl.Int32)
+                for col in batch
+            ])
+            gc.collect()
+
+    memory_after = df.estimated_size() / (1024**3)
+    memory_saved_gb = memory_before - memory_after
+    print(f"\nEstimated memory usage after conversion: {memory_after:.4f} GB")
+    print(f"Memory saved: {memory_saved_gb:.4f} GB ({memory_saved_gb/memory_before*100:.1f}%)")
+
+    return df
+
+
 
 def do_orthogonalization_and_POT_weighting(df, pot_dic, normalizing_POT):
 
     print("pot_dic:")
-    for k, v in pot_dic.items():
+    detailed_run_periods = []
+    for k, v in sorted(pot_dic.items(), key=lambda item: item[0]):
         print(f"    {k}: {v}")
+        filetype, detailed_run_period = k
+        detailed_run_periods.append(detailed_run_period)
+    detailed_run_periods = sorted(set(detailed_run_periods))
+    print()
+
+    normalizing_run_periods = ["4a", "4nota5"]
+
+    # keep 4a separately normalized, since it's different from the rest of run 4
+    # eventually, this will be used to separately normalize run 1, run 2, run 3, etc.
+    df = df.with_columns([
+        pl.when(
+            
+        pl.col("detailed_run_period") == "4a").then(pl.lit("4a"))
+
+        .when(pl.col("detailed_run_period") == "4b").then(pl.lit("4nota5"))
+        .when(pl.col("detailed_run_period") == "4c").then(pl.lit("4nota5"))
+        .when(pl.col("detailed_run_period") == "4d").then(pl.lit("4nota5"))
+        .when(pl.col("detailed_run_period") == "4bcd").then(pl.lit("4nota5"))
+        .when(pl.col("detailed_run_period") == "5").then(pl.lit("4nota5"))
+
+        .otherwise(pl.lit("error!"))
+        .alias("normalizing_run_period")
+    ])
+
+    normalizing_run_period_pot_dic = defaultdict(float)
+    for k, v in pot_dic.items():
+        filetype, detailed_run_period = k
+
+        if detailed_run_period == "4a":
+            normalizing_run_period_pot_dic[(filetype, "4a")] += v
+        
+        elif detailed_run_period == "4b":
+            normalizing_run_period_pot_dic[(filetype, "4nota5")] += v
+        elif detailed_run_period == "4c":
+            normalizing_run_period_pot_dic[(filetype, "4nota5")] += v
+        elif detailed_run_period == "4d":
+            normalizing_run_period_pot_dic[(filetype, "4nota5")] += v
+        elif detailed_run_period == "4bcd":
+            normalizing_run_period_pot_dic[(filetype, "4nota5")] += v
+        elif detailed_run_period == "5":
+            normalizing_run_period_pot_dic[(filetype, "4nota5")] += v
+        
+        else:
+            raise ValueError("Detailed run period not found in pot_dic!", detailed_run_period)
+
+    print("normalizing_run_period_pot_dic:")
+    for k, v in sorted(normalizing_run_period_pot_dic.items(), key=lambda item: item[0]):
+        print(f"    {k}: {v}")
+    print()
+
+    norm_goal_pot_dic = {}
+    for normalizing_run_period in normalizing_run_periods:
+        norm_goal_pot_dic[normalizing_run_period] = 0
+    data_in_files = False
+    for k, v in pot_dic.items():
+        filetype, detailed_run_period = k
+        if filetype == "data":
+            data_in_files = True
+
+            if detailed_run_period == "4a":
+                norm_goal_pot_dic["4a"] += v
+
+            elif detailed_run_period == "4b":
+                norm_goal_pot_dic["4nota5"] += v
+            elif detailed_run_period == "4c":
+                norm_goal_pot_dic["4nota5"] += v
+            elif detailed_run_period == "4d":
+                norm_goal_pot_dic["4nota5"] += v
+            elif detailed_run_period == "4bcd":
+                norm_goal_pot_dic["4nota5"] += v
+            elif detailed_run_period == "5":
+                norm_goal_pot_dic["4nota5"] += v
+
+            else:
+                raise ValueError("Detailed run period not found in pot_dic!", detailed_run_period)
+    if data_in_files:
+        total_norm_goal_pot = sum(norm_goal_pot_dic.values())
+        extra_pot_scale_factor = normalizing_POT / total_norm_goal_pot
+        print(f"applying extra pot scale factor {extra_pot_scale_factor} to norm_goal_pot_dic...")
+        for k, v in norm_goal_pot_dic.items():
+            norm_goal_pot_dic[k] = v * extra_pot_scale_factor
+    else: # no data (possibly DetVar processing), just normalize to nu_overlay CV POTs found earlier
+        for k, v in normalizing_run_period_pot_dic.items():
+            filetype, normalizing_run_period = k
+            if filetype == 'nu_overlay':
+                norm_goal_pot_dic[normalizing_run_period] += v
+    
+    print("norm_goal_pot_dic:")
+    for k, v in sorted(norm_goal_pot_dic.items(), key=lambda item: item[0]):
+        print(f"    {k}: {v}")
+    print()
+
+    # apply norm_goal_pot_dic to df
+    df = df.with_columns([
+        pl.when(pl.col("normalizing_run_period") == "4a").then(pl.lit(norm_goal_pot_dic["4a"]))
+        .when(pl.col("normalizing_run_period") == "4nota5").then(pl.lit(norm_goal_pot_dic["4nota5"]))
+        .otherwise(pl.lit(None).cast(pl.Float64))
+        .alias("norm_goal_pot")
+    ])
 
     original_length = df.height
 
-    summed_POT_nc_1pi0 = pot_dic['nc_pi0_overlay'] + pot_dic['nu_overlay']
-    summed_POT_nue_cc = pot_dic['nue_overlay'] + pot_dic['nu_overlay']
-    summed_POT_numucc_pi0 = pot_dic['numucc_pi0_overlay'] + pot_dic['nu_overlay']
+    # these dataframes store the POTs split by norm_run_period, summed over the different filetypes
+    summed_POT_nc_1pi0_dic = {}
+    summed_POT_nue_cc_dic = {}
+    summed_POT_numucc_pi0_dic = {}
+    for normalizing_run_period in normalizing_run_periods:
+        summed_POT_nc_1pi0_dic[normalizing_run_period] = 0
+        summed_POT_nue_cc_dic[normalizing_run_period] = 0
+        summed_POT_numucc_pi0_dic[normalizing_run_period] = 0
+        
+    for k, normalizing_pot in normalizing_run_period_pot_dic.items():
+        filetype, normalizing_run_period = k
+        if filetype == 'nc_pi0_overlay' or filetype == 'nu_overlay':
+            summed_POT_nc_1pi0_dic[normalizing_run_period] += normalizing_pot
+        if filetype == 'nue_overlay' or filetype == 'nu_overlay':
+            summed_POT_nue_cc_dic[normalizing_run_period] += normalizing_pot
+        if filetype == 'numucc_pi0_overlay' or filetype == 'nu_overlay':
+            summed_POT_numucc_pi0_dic[normalizing_run_period] += normalizing_pot
+
+    print("summed_POT_nc_1pi0_dic:")
+    for k, v in sorted(summed_POT_nc_1pi0_dic.items(), key=lambda item: item[0]):
+        print(f"    {k}: {v}")
+    print()
+
+    print("summed_POT_nue_cc_dic:")
+    for k, v in sorted(summed_POT_nue_cc_dic.items(), key=lambda item: item[0]):
+        print(f"    {k}: {v}")
+    print()
+
+    print("summed_POT_numucc_pi0_dic:")
+    for k, v in sorted(summed_POT_numucc_pi0_dic.items(), key=lambda item: item[0]):
+        print(f"    {k}: {v}")
+    print()
 
     print("creating masks...")
 
@@ -69,12 +251,10 @@ def do_orthogonalization_and_POT_weighting(df, pot_dic, normalizing_POT):
     )
 
     nu_overlay_other_mask = (
-        (
-            pl.col("filetype") == 'nu_overlay') &
-            ~((pl.col("wc_truth_isCC") == 0) & (pl.col("wc_truth_NprimPio") == 1) & (pl.col("wc_truth_vtxInside") == 1)) &
-            ~((pl.col("wc_truth_isCC") == 1) & (pl.col("wc_truth_nuPdg").abs() == 12) & (pl.col("wc_truth_vtxInside") == 1) &
-            ~((pl.col("wc_truth_isCC") == 1) & (pl.col("wc_truth_nuPdg") == 14) & (pl.col("wc_truth_NprimPio") == 1) & (pl.col("wc_truth_vtxInside") == 1))
-        )
+        (pl.col("filetype") == 'nu_overlay') & # nu_overlay
+        ~((pl.col("wc_truth_isCC") == 0) & (pl.col("wc_truth_NprimPio") == 1) & (pl.col("wc_truth_vtxInside") == 1)) & # not NC 1pi0 inFV
+        ~((pl.col("wc_truth_isCC") == 1) & (pl.col("wc_truth_nuPdg").abs() == 12) & (pl.col("wc_truth_vtxInside") == 1)) & # not nueCC inFV
+        ~((pl.col("wc_truth_isCC") == 1) & (pl.col("wc_truth_nuPdg") == 14) & (pl.col("wc_truth_NprimPio") == 1) & (pl.col("wc_truth_vtxInside") == 1)) # not numuCC 1pi0 inFV
     )
 
     dirt_mask = pl.col("filetype") == 'dirt_overlay'
@@ -83,34 +263,59 @@ def do_orthogonalization_and_POT_weighting(df, pot_dic, normalizing_POT):
     iso1g_mask = pl.col("filetype") == 'isotropic_one_gamma_overlay'
     data_mask = pl.col("filetype") == 'data'
 
-    print("adding wc_event_type_POT variable...")
+    print("adding wc_normrunperiod_eventtype_POT variable...")
 
-    # Build the wc_event_type_POT column using nested when-then-otherwise
-    # Start with default values from pot_dic, building a chain
-    wc_event_type_POT_expr = None
-    for filetype in pot_dic.keys():
-        if wc_event_type_POT_expr is None:
-            wc_event_type_POT_expr = pl.when(pl.col("filetype") == filetype).then(pl.lit(pot_dic[filetype]))
+    # Building the wc_normrunperiod_eventtype_POT column using nested when-then-otherwise
+    # Starting with default values from pot_dic, building a chain
+    wc_normrunperiod_eventtype_POT_expr = None
+    for k, normalizing_pot in sorted(normalizing_run_period_pot_dic.items(), key=lambda item: item[0]):
+        filetype, normalizing_run_period = k
+        if normalizing_pot == 0:
+            raise ValueError(f"normalizing_pot is zero for {filetype} {normalizing_run_period}!")
+        if wc_normrunperiod_eventtype_POT_expr is None:
+            wc_normrunperiod_eventtype_POT_expr = pl.when((pl.col("filetype") == filetype) & (pl.col("normalizing_run_period") == normalizing_run_period)).then(pl.lit(normalizing_pot))
         else:
-            wc_event_type_POT_expr = wc_event_type_POT_expr.when(pl.col("filetype") == filetype).then(pl.lit(pot_dic[filetype]))
+            wc_normrunperiod_eventtype_POT_expr = wc_normrunperiod_eventtype_POT_expr.when((pl.col("filetype") == filetype) & (pl.col("normalizing_run_period") == normalizing_run_period)).then(pl.lit(normalizing_pot))
     
-    # Add the final otherwise clause (shouldn't happen if all filetypes are covered, but for safety)
-    wc_event_type_POT_expr = wc_event_type_POT_expr.otherwise(pl.lit(None).cast(pl.Float64))
+    # Add the final otherwise clause (shouldn't happen if all filetypes are covered, will error if used later)
+    wc_normrunperiod_eventtype_POT_expr = wc_normrunperiod_eventtype_POT_expr.otherwise(pl.lit(None).cast(pl.Float64))
     
     # Override with summed POTs for specific masks (these are checked first)
-    wc_event_type_POT_expr = (
-        pl.when(nc_pi0_overlay_true_nc_1pi0_mask).then(pl.lit(summed_POT_nc_1pi0))
-        .when(nu_overlay_true_nc_1pi0_mask).then(pl.lit(summed_POT_nc_1pi0))
-        .when(numucc_pi0_overlay_true_numucc_pi0_mask).then(pl.lit(summed_POT_numucc_pi0))
-        .when(nu_overlay_true_numucc_pi0_mask).then(pl.lit(summed_POT_numucc_pi0))
-        .when(nue_overlay_true_nue_cc_mask).then(pl.lit(summed_POT_nue_cc))
-        .when(nu_overlay_true_nue_cc_mask).then(pl.lit(summed_POT_nue_cc))
-        .otherwise(wc_event_type_POT_expr)
-    )
-
+    for normalizing_run_period in normalizing_run_periods:
+        wc_normrunperiod_eventtype_POT_expr = (
+            pl.when((nc_pi0_overlay_true_nc_1pi0_mask) & (pl.col("normalizing_run_period") == normalizing_run_period)).then(pl.lit(summed_POT_nc_1pi0_dic[normalizing_run_period]))
+            .when((nu_overlay_true_nc_1pi0_mask) & (pl.col("normalizing_run_period") == normalizing_run_period)).then(pl.lit(summed_POT_nc_1pi0_dic[normalizing_run_period]))
+            .when((numucc_pi0_overlay_true_numucc_pi0_mask) & (pl.col("normalizing_run_period") == normalizing_run_period)).then(pl.lit(summed_POT_numucc_pi0_dic[normalizing_run_period]))
+            .when((nu_overlay_true_numucc_pi0_mask) & (pl.col("normalizing_run_period") == normalizing_run_period)).then(pl.lit(summed_POT_numucc_pi0_dic[normalizing_run_period]))
+            .when((nue_overlay_true_nue_cc_mask) & (pl.col("normalizing_run_period") == normalizing_run_period)).then(pl.lit(summed_POT_nue_cc_dic[normalizing_run_period]))
+            .when((nu_overlay_true_nue_cc_mask) & (pl.col("normalizing_run_period") == normalizing_run_period)).then(pl.lit(summed_POT_nue_cc_dic[normalizing_run_period]))
+            .otherwise(wc_normrunperiod_eventtype_POT_expr)
+        )
+    
+    # Apply the expression to the dataframe
     df = df.with_columns([
-        wc_event_type_POT_expr.alias("wc_event_type_POT")
+        wc_normrunperiod_eventtype_POT_expr.alias("wc_normrunperiod_eventtype_POT")
     ])
+
+    # check for null wc_normrunperiod_eventtype_POT values
+    if df["wc_normrunperiod_eventtype_POT"].is_null().any() or (df["wc_normrunperiod_eventtype_POT"] == 0).any():
+        num_null = df["wc_normrunperiod_eventtype_POT"].is_null().sum()
+        num_zero = (df["wc_normrunperiod_eventtype_POT"] == 0).sum()
+
+        print(f"about to run debug loop, with {min(df.height, 10)=}")
+
+        zeros_df = df.filter(df["wc_normrunperiod_eventtype_POT"] == 0)
+
+        # print filetype, detailed_run_period, normalizing_run_period for each zero value
+        for i in range(min(zeros_df.height, 10)):
+            if zeros_df["wc_normrunperiod_eventtype_POT"][i] == 0:
+                wc_normrunperiod_eventtype_POT = zeros_df["wc_normrunperiod_eventtype_POT"][i]
+                filetype = zeros_df["filetype"][i]
+                detailed_run_period = zeros_df["detailed_run_period"][i]
+                normalizing_run_period = zeros_df["normalizing_run_period"][i]
+                print(f"wc_normrunperiod_eventtype_POT: {wc_normrunperiod_eventtype_POT}, filetype: {filetype}, detailed_run_period: {detailed_run_period}, normalizing_run_period: {normalizing_run_period}")
+
+        raise ValueError(f"wc_normrunperiod_eventtype_POT has {num_null} null values and {num_zero} values equal to zero!")
 
     # Filter out unwanted events by keeping only the events we want
     combined_mask = (
@@ -123,6 +328,7 @@ def do_orthogonalization_and_POT_weighting(df, pot_dic, normalizing_POT):
 
     print("applying combined mask...")
     df = df.filter(combined_mask)
+    gc.collect()
 
     print("adding net weights...")
 
@@ -140,13 +346,29 @@ def do_orthogonalization_and_POT_weighting(df, pot_dic, normalizing_POT):
         .then(pl.lit(1.0))
         .otherwise(weight_temp)
     )
+
+    df = df.with_columns([
+        weight_temp.alias("weight_cv_weight_spline")
+    ])
+
+    # check for null, nan or infinite values in weight_cv_weight_spline
+    if df["weight_cv_weight_spline"].is_null().any() or df["weight_cv_weight_spline"].is_nan().any() or df["weight_cv_weight_spline"].is_infinite().any():
+        num_null = df["weight_cv_weight_spline"].is_null().sum()
+        num_nan = df["weight_cv_weight_spline"].is_nan().sum()
+        num_infinite = df["weight_cv_weight_spline"].is_infinite().sum()
+        raise ValueError(f"weight_cv_weight_spline has {num_null} null, {num_nan} nan or {num_infinite} infinite values!")
     
     # Compute final net weight
-    wc_net_weight = weight_temp * pl.lit(normalizing_POT) / pl.col("wc_event_type_POT")
-    
     df = df.with_columns([
-        wc_net_weight.alias("wc_net_weight")
+        (pl.col("weight_cv_weight_spline") * (pl.col("norm_goal_pot") / pl.col("wc_normrunperiod_eventtype_POT"))).alias("wc_net_weight")
     ])
+
+    # check for null, nan or infinite values in wc_net_weight
+    if df["wc_net_weight"].is_null().any() or df["wc_net_weight"].is_nan().any() or df["wc_net_weight"].is_infinite().any():
+        num_null = df["wc_net_weight"].is_null().sum()
+        num_nan = df["wc_net_weight"].is_nan().sum()
+        num_infinite = df["wc_net_weight"].is_infinite().sum()
+        raise ValueError(f"wc_net_weight has {num_null} null, {num_nan} nan or {num_infinite} infinite values!")
 
     final_length = df.height
 
@@ -317,33 +539,55 @@ def do_wc_postprocessing(df):
         has_photonuclear_absorption_flags = []
         has_pi0_dalitz_decay_flags = []
         max_true_prim_proton_energies = []
+        max_true_prim_proton_costhetas = []
+        max_true_prim_proton_phis = []
         sum_true_prim_proton_energies = []
+        max_true_prim_neutron_energies = []
+        max_true_prim_neutron_costhetas = []
+        max_true_prim_neutron_phis = []
+        sum_true_prim_neutron_energies = []
         true_leading_shower_energies = []
         true_leading_shower_costhetas = []
+        true_leading_shower_phis = []
         true_subleading_shower_energies = []
         true_subleading_shower_costhetas = []
+        true_subleading_shower_phis = []
         true_leading_pi0_energies = []
         true_leading_pi0_costhetas = []
+        true_leading_pi0_phis = []
         true_leading_pi0_opening_angles = []
         true_outgoing_lepton_energies = []
         true_nums_prim_protons = []
         true_nums_prim_protons_35 = []
+        true_nums_prim_neutrons = []
+        true_nums_prim_neutrons_35 = []
         truth_ids = df["wc_truth_id"].to_numpy()
         truth_pdgs = df["wc_truth_pdg"].to_numpy()
         truth_mothers = df["wc_truth_mother"].to_numpy()
         truth_startMomentums = df["wc_truth_startMomentum"].to_numpy()
         for i in tqdm(range(df.shape[0]), desc="Adding WC truth particle variables", mininterval=10):
             max_true_prim_proton_energy = -1.
+            max_true_prim_proton_costheta = -2.
+            max_true_prim_proton_phi = -999.
             sum_true_prim_proton_energy = 0.
+            max_true_prim_neutron_energy = -1.
+            max_true_prim_neutron_costheta = -2.
+            max_true_prim_neutron_phi = -999.
+            sum_true_prim_neutron_energy = 0.
             max_shower_energy = -1.
             max_shower_costheta = -2.
+            max_shower_phi = -999.
             second_max_shower_energy = -1.
             second_max_shower_costheta = -2.
+            second_max_shower_phi = -999.
             max_pi0_energy = -1.
             max_pi0_costheta = -2.
+            max_pi0_phi = -999.
             max_pi0_opening_angle = -1.
             true_num_prim_protons = 0
             true_num_prim_protons_35 = 0
+            true_num_prim_neutrons = 0
+            true_num_prim_neutrons_35 = 0
             true_outgoing_lepton_energy = -1.
             truth_id_list = truth_ids[i]
             truth_pdg_list = truth_pdgs[i]
@@ -376,11 +620,14 @@ def do_wc_postprocessing(df):
                     if truth_startMomentum_list[j][3] * 1000. > max_shower_energy:
                         second_max_shower_energy = max_shower_energy
                         second_max_shower_costheta = max_shower_costheta
+                        second_max_shower_phi = max_shower_phi
                         max_shower_energy = truth_startMomentum_list[j][3] * 1000.
                         max_shower_costheta = truth_startMomentum_list[j][2] / truth_startMomentum_list[j][3] # should be basically z / (x**2 + y**2 + z**2)**0.5
+                        max_shower_phi = np.arctan2(truth_startMomentum_list[j][0], truth_startMomentum_list[j][1]) * 180. / np.pi
                     elif truth_startMomentum_list[j][3] * 1000. > second_max_shower_energy:
                         second_max_shower_energy = truth_startMomentum_list[j][3] * 1000.
                         second_max_shower_costheta = truth_startMomentum_list[j][2] / truth_startMomentum_list[j][3] # should be basically z / (x**2 + y**2 + z**2)**0.5
+                        second_max_shower_phi = np.arctan2(truth_startMomentum_list[j][0], truth_startMomentum_list[j][1]) * 180. / np.pi
 
                 if truth_pdg_list[j] == 111: # pi0
                     curr_pi0_energy = truth_startMomentum_list[j][3] * 1000. - 134.9768
@@ -389,6 +636,7 @@ def do_wc_postprocessing(df):
                         max_tot_momentum = np.sqrt(truth_startMomentum_list[j][0]**2 + truth_startMomentum_list[j][1]**2 + truth_startMomentum_list[j][2]**2)
                         max_z_momentum = truth_startMomentum_list[j][2]
                         max_pi0_costheta = max_z_momentum / max_tot_momentum
+                        max_pi0_phi = np.arctan2(truth_startMomentum_list[j][0], truth_startMomentum_list[j][1]) * 180. / np.pi
 
                         pi0_daughter_indices = []
                         for k in range(num_particles):
@@ -415,38 +663,73 @@ def do_wc_postprocessing(df):
                     true_num_prim_protons += 1
                     if truth_startMomentum_list[j][3] * 1000. - 938.272088 > 35.:
                         true_num_prim_protons_35 += 1
-                    max_true_prim_proton_energy = max(max_true_prim_proton_energy, truth_startMomentum_list[j][3] * 1000. - 938.272088)
+                    if truth_startMomentum_list[j][3] * 1000. - 938.272088 > max_true_prim_proton_energy:
+                        max_true_prim_proton_energy = truth_startMomentum_list[j][3] * 1000. - 938.272088
+                        max_true_prim_proton_costheta = truth_startMomentum_list[j][2] / truth_startMomentum_list[j][3] # should be basically z / (x**2 + y**2 + z**2)**0.5
+                        max_true_prim_proton_phi = np.arctan2(truth_startMomentum_list[j][0], truth_startMomentum_list[j][1]) * 180. / np.pi
                     sum_true_prim_proton_energy += truth_startMomentum_list[j][3] * 1000. - 938.272088
+
+                if truth_mother_list[j] == 0 and truth_pdg_list[j] == 2112: # primary neutron
+                    true_num_prim_neutrons += 1
+                    if truth_startMomentum_list[j][3] * 1000. - 939.565422 > 35.:
+                        true_num_prim_neutrons_35 += 1
+                    if truth_startMomentum_list[j][3] * 1000. - 939.565422 > max_true_prim_neutron_energy:
+                        max_true_prim_neutron_energy = truth_startMomentum_list[j][3] * 1000. - 939.565422
+                        max_true_prim_neutron_costheta = truth_startMomentum_list[j][2] / truth_startMomentum_list[j][3] # should be basically z / (x**2 + y**2 + z**2)**0.5
+                        max_true_prim_neutron_phi = np.arctan2(truth_startMomentum_list[j][0], truth_startMomentum_list[j][1]) * 180. / np.pi
+                    sum_true_prim_neutron_energy += truth_startMomentum_list[j][3] * 1000. - 939.565422
 
                 if truth_mother_list[j] == 0 and 11 <= abs(truth_pdg_list[j]) <= 16: # lepton
                     true_outgoing_lepton_energy = truth_startMomentum_list[j][3] * 1000.
 
             max_true_prim_proton_energies.append(max_true_prim_proton_energy)
+            max_true_prim_proton_costhetas.append(max_true_prim_proton_costheta)
+            max_true_prim_proton_phis.append(max_true_prim_proton_phi)
             sum_true_prim_proton_energies.append(sum_true_prim_proton_energy)
+            max_true_prim_neutron_energies.append(max_true_prim_neutron_energy)
+            max_true_prim_neutron_costhetas.append(max_true_prim_neutron_costheta)
+            max_true_prim_neutron_phis.append(max_true_prim_neutron_phi)
+            sum_true_prim_neutron_energies.append(sum_true_prim_neutron_energy)
             true_outgoing_lepton_energies.append(true_outgoing_lepton_energy)
             true_nums_prim_protons.append(true_num_prim_protons)
             true_nums_prim_protons_35.append(true_num_prim_protons_35)
+            true_nums_prim_neutrons.append(true_num_prim_neutrons)
+            true_nums_prim_neutrons_35.append(true_num_prim_neutrons_35)
             true_leading_shower_energies.append(max_shower_energy)
             true_leading_shower_costhetas.append(max_shower_costheta)
+            true_leading_shower_phis.append(max_shower_phi)
             true_subleading_shower_energies.append(second_max_shower_energy)
             true_subleading_shower_costhetas.append(second_max_shower_costheta)
+            true_subleading_shower_phis.append(second_max_shower_phi)
             true_leading_pi0_energies.append(max_pi0_energy)
             true_leading_pi0_costhetas.append(max_pi0_costheta)
+            true_leading_pi0_phis.append(max_pi0_phi)
             true_leading_pi0_opening_angles.append(max_pi0_opening_angle)
             has_photonuclear_absorption_flags.append(has_photonuclear_absorption)
             has_pi0_dalitz_decay_flags.append(has_pi0_dalitz_decay)
 
         df["wc_true_max_prim_proton_energy"] = max_true_prim_proton_energies
+        df["wc_true_max_prim_proton_costheta"] = max_true_prim_proton_costhetas
+        df["wc_true_max_prim_proton_phi"] = max_true_prim_proton_phis
         df["wc_true_sum_prim_proton_energy"] = sum_true_prim_proton_energies
-        df["wc_true_outgoing_lepton_energy"] = true_outgoing_lepton_energies
         df["wc_true_num_prim_protons"] = true_nums_prim_protons
         df["wc_true_num_prim_protons_35"] = true_nums_prim_protons_35
+        df["wc_true_max_prim_neutron_energy"] = max_true_prim_neutron_energies
+        df["wc_true_max_prim_neutron_costheta"] = max_true_prim_neutron_costhetas
+        df["wc_true_max_prim_neutron_phi"] = max_true_prim_neutron_phis
+        df["wc_true_sum_prim_neutron_energy"] = sum_true_prim_neutron_energies
+        df["wc_true_num_prim_neutrons"] = true_nums_prim_neutrons
+        df["wc_true_num_prim_neutrons_35"] = true_nums_prim_neutrons_35
+        df["wc_true_outgoing_lepton_energy"] = true_outgoing_lepton_energies
         df["wc_true_leading_shower_energy"] = true_leading_shower_energies
         df["wc_true_leading_shower_costheta"] = true_leading_shower_costhetas
+        df["wc_true_leading_shower_phi"] = true_leading_shower_phis
         df["wc_true_subleading_shower_energy"] = true_subleading_shower_energies
         df["wc_true_subleading_shower_costheta"] = true_subleading_shower_costhetas
+        df["wc_true_subleading_shower_phi"] = true_subleading_shower_phis
         df["wc_true_leading_pi0_energy"] = true_leading_pi0_energies
         df["wc_true_leading_pi0_costheta"] = true_leading_pi0_costhetas
+        df["wc_true_leading_pi0_phi"] = true_leading_pi0_phis
         df["wc_true_leading_pi0_opening_angle"] = true_leading_pi0_opening_angles
         df["wc_true_has_photonuclear_absorption"] = pd.Series(has_photonuclear_absorption_flags, dtype=bool)
         df["wc_true_has_pi0_dalitz_decay"] = pd.Series(has_pi0_dalitz_decay_flags, dtype=bool)
@@ -550,6 +833,76 @@ def do_wc_postprocessing(df):
     df["wc_reco_shower_phi"] = shower_phis
     df["wc_reco_distance_to_boundary"] = distances_to_boundary
     df["wc_reco_backwards_projected_dist"] = backwards_projected_dists
+
+    max_prim_proton_energies = []
+    max_prim_proton_costhetas = []
+    max_prim_proton_phis = []
+    max_prim_other_track_energies = []
+    max_prim_other_track_costhetas = []
+    max_prim_other_track_phis = []
+    num_protons_35_MeV_75cm_from_reco_shower_vtx_list = []
+    reco_pdg = df["wc_reco_pdg"].to_numpy()
+    reco_mother = df["wc_reco_mother"].to_numpy()
+    reco_startMomentum = df["wc_reco_startMomentum"].to_numpy()
+    reco_startXYZT = df["wc_reco_startXYZT"].to_numpy()
+    showervtx_x = df["wc_reco_showervtxX"].to_numpy()
+    showervtx_y = df["wc_reco_showervtxY"].to_numpy()
+    showervtx_z = df["wc_reco_showervtxZ"].to_numpy()
+    for i in tqdm(range(df.shape[0]), desc="Adding WC reco prim proton and other track variables", mininterval=10):
+        if isinstance(reco_pdg[i], float) and np.isnan(reco_pdg[i]):
+            max_prim_proton_energies.append(np.nan)
+            max_prim_proton_costhetas.append(np.nan)
+            max_prim_proton_phis.append(np.nan)
+            max_prim_other_track_energies.append(np.nan)
+            max_prim_other_track_costhetas.append(np.nan)
+            max_prim_other_track_phis.append(np.nan)
+            num_protons_35_MeV_75cm_from_reco_shower_vtx_list.append(np.nan)
+            continue
+
+        num_particles = len(reco_pdg[i])
+        max_prim_proton_energy = -1.
+        max_prim_proton_costheta = -2.
+        max_prim_proton_phi = -999.
+        max_prim_other_track_energy = -1.
+        max_prim_other_track_costheta = -2.
+        max_prim_other_track_phi = -999.
+        num_protons_35_MeV_75cm_from_reco_shower_vtx = 0
+        shower_vtx_valid = not (isinstance(showervtx_x[i], float) and np.isnan(showervtx_x[i]))
+        for j in range(num_particles):
+            if reco_pdg[i][j] == 2212: # proton (any, not just primary)
+                if shower_vtx_valid and reco_startMomentum[i][j][3] > 35:
+                    dist = np.sqrt((reco_startXYZT[i][j][0] - showervtx_x[i])**2 +
+                                   (reco_startXYZT[i][j][1] - showervtx_y[i])**2 +
+                                   (reco_startXYZT[i][j][2] - showervtx_z[i])**2)
+                    if dist < 75:
+                        num_protons_35_MeV_75cm_from_reco_shower_vtx += 1
+            if reco_mother[i][j] == 0: # primary
+                if reco_pdg[i][j] == 2212: # proton
+                    if reco_startMomentum[i][j][3] > max_prim_proton_energy:
+                        max_prim_proton_energy = reco_startMomentum[i][j][3]
+                        max_prim_proton_costheta = reco_startMomentum[i][j][2] / reco_startMomentum[i][j][3] # should be basically z / (x**2 + y**2 + z**2)**0.5
+                        max_prim_proton_phi = np.arctan2(reco_startMomentum[i][j][0], reco_startMomentum[i][j][1]) * 180. / np.pi
+                elif reco_pdg[i][j] == 13: # other track (I think 13 is the only one)
+                    if reco_startMomentum[i][j][3] > max_prim_other_track_energy:
+                        max_prim_other_track_energy = reco_startMomentum[i][j][3]
+                        max_prim_other_track_costheta = reco_startMomentum[i][j][2] / reco_startMomentum[i][j][3] # should be basically z / (x**2 + y**2 + z**2)**0.5
+                        max_prim_other_track_phi = np.arctan2(reco_startMomentum[i][j][0], reco_startMomentum[i][j][1]) * 180. / np.pi
+
+        max_prim_proton_energies.append(max_prim_proton_energy)
+        max_prim_proton_costhetas.append(max_prim_proton_costheta)
+        max_prim_proton_phis.append(max_prim_proton_phi)
+        max_prim_other_track_energies.append(max_prim_other_track_energy)
+        max_prim_other_track_costhetas.append(max_prim_other_track_costheta)
+        max_prim_other_track_phis.append(max_prim_other_track_phi)
+        num_protons_35_MeV_75cm_from_reco_shower_vtx_list.append(num_protons_35_MeV_75cm_from_reco_shower_vtx)
+
+    df["wc_reco_max_prim_proton_energy"] = max_prim_proton_energies
+    df["wc_reco_max_prim_proton_costheta"] = max_prim_proton_costhetas
+    df["wc_reco_max_prim_proton_phi"] = max_prim_proton_phis
+    df["wc_reco_max_prim_other_track_energy"] = max_prim_other_track_energies
+    df["wc_reco_max_prim_other_track_costheta"] = max_prim_other_track_costhetas
+    df["wc_reco_max_prim_other_track_phi"] = max_prim_other_track_phis
+    df["wc_reco_num_protons_35_MeV_75cm_from_reco_shower_vtx"] = num_protons_35_MeV_75cm_from_reco_shower_vtx_list
 
     return df
 
@@ -801,6 +1154,10 @@ def add_signal_categories(all_df):
         # Proton energy
         (pl.col("wc_true_max_prim_proton_energy") >= 35).alias("wc_truth_Np"),
         (pl.col("wc_true_max_prim_proton_energy") < 35).alias("wc_truth_0p"),
+
+        # neutron energy
+        (pl.col("wc_true_max_prim_neutron_energy") >= 35).alias("wc_truth_Nn"),
+        (pl.col("wc_true_max_prim_neutron_energy") < 35).alias("wc_truth_0n"),
         
         # CC/NC types
         (pl.col("wc_truth_isCC").cast(pl.Boolean) & (pl.col("wc_truth_nuPdg").abs() == 14)).alias("wc_truth_numuCC"),
@@ -832,6 +1189,23 @@ def add_signal_categories(all_df):
         (pl.col("wc_truth_nueCC") & pl.col("wc_truth_NCDelta").cast(pl.Boolean)).alias("wc_truth_nueCCDeltaRad"),
     ])
 
+    all_df = all_df.with_columns([
+        (
+            (pl.col("wc_truth_single_photon") == 1) &
+            (
+                (pl.col("wc_truth_isCC") == 0) |
+                ((pl.col("wc_truth_isCC") == 1) & (pl.col("wc_truth_nuPdg").abs() == 14) & ((pl.col("wc_truth_muonMomentum_3") - 0.105658).abs() < 0.1))
+            )
+        ).cast(pl.Int32).alias("erin_inclusive_1g_true_sig")
+    ])
+
+    all_df = all_df.with_columns([
+        (
+            pl.col("blip_backtrack_cones_n")
+            + pl.col("wc_reco_num_protons_35_MeV")
+        ).alias("wc_reco_num_protons_35_MeV_plus_backtrack_blips")
+    ])
+
     topological_conditions = []
     print("Adding topological signal categories...")
     for query_text in topological_category_queries:
@@ -859,6 +1233,101 @@ def add_signal_categories(all_df):
     total_events = all_df.height
     if sum(category_counts_unweighted) != total_events:
         print(f"Error: Sum of topological category counts ({sum(category_counts_unweighted)}) != total events ({total_events}), missing or overlapping categories?")
+        condition_match_count = pl.sum_horizontal([condition.cast(pl.Int8) for condition in topological_conditions])
+        num_no_match, num_multi_match = all_df.select([
+            (condition_match_count == 0).sum().alias("num_no_match"),
+            (condition_match_count > 1).sum().alias("num_multi_match"),
+        ]).row(0)
+        print(f"Debug topological category assignment: no_match={num_no_match}, multi_match={num_multi_match}")
+        # Also check for category=-1 directly; events where ALL conditions are null
+        # won't be caught by the no_match check (since null == 0 returns null, not True).
+        cat_neg1_count = all_df.filter(pl.col('topological_signal_category') == -1).height
+        cat_null_count = all_df.filter(pl.col('topological_signal_category').is_null()).height
+        print(f"  topological_signal_category == -1: {cat_neg1_count}, null: {cat_null_count}")
+        if cat_neg1_count > 0:
+            cat_neg1_df = all_df.filter(pl.col('topological_signal_category') == -1)
+            print("Category=-1 by filetype (top 10):")
+            print(cat_neg1_df.group_by("filetype").len().sort("len", descending=True).head(10))
+            print("Category=-1 null truth variable counts:")
+            print(cat_neg1_df.select([
+                pl.col("wc_truth_inFV").is_null().sum().alias("null_inFV"),
+                pl.col("wc_truth_0e").is_null().sum().alias("null_0e"),
+                pl.col("wc_truth_0g").is_null().sum().alias("null_0g"),
+                pl.col("wc_truth_3plusg").is_null().sum().alias("null_3plusg"),
+                pl.col("normal_overlay").is_null().sum().alias("null_normal_overlay"),
+            ]))
+            for row in cat_neg1_df.select([
+                "filename", "filetype", "run", "subrun", "event",
+                "normal_overlay", "del1g_overlay", "iso1g_overlay",
+                "wc_truth_inFV", "wc_truth_0e", "wc_truth_0g",
+                "wc_truth_1g", "wc_truth_2g", "wc_truth_3plusg",
+                "wc_truth_0mu", "wc_truth_1mu", "wc_truth_Np", "wc_truth_0p",
+                "wc_truth_nuPdg", "wc_truth_isCC",
+            ]).head(5).iter_rows(named=True):
+                print(f"Category=-1 example: {row}")
+        if num_no_match > 0:
+            no_match_df = all_df.filter(condition_match_count == 0)
+            print("No-match by filetype (top 10):")
+            print(no_match_df.group_by("filetype").len().sort("len", descending=True).head(10))
+            print("No-match overlay flags:")
+            print(no_match_df.select([
+                pl.col("normal_overlay").cast(pl.Int64).sum().alias("normal_overlay"),
+                pl.col("del1g_overlay").cast(pl.Int64).sum().alias("del1g_overlay"),
+                pl.col("iso1g_overlay").cast(pl.Int64).sum().alias("iso1g_overlay"),
+            ]))
+            print("No-match truth signature counts (top 10):")
+            print(no_match_df.group_by([
+                "wc_truth_inFV",
+                "wc_truth_0e",
+                "wc_truth_1e",
+                "wc_truth_0g",
+                "wc_truth_1g",
+                "wc_truth_2g",
+                "wc_truth_3plusg",
+                "wc_truth_0mu",
+                "wc_truth_1mu",
+                "wc_truth_Np",
+                "wc_truth_0p",
+            ]).len().sort("len", descending=True).head(10))
+            for row in no_match_df.select([
+                "filename",
+                "filetype",
+                "run",
+                "subrun",
+                "event",
+                "normal_overlay",
+                "del1g_overlay",
+                "iso1g_overlay",
+                "wc_truth_inFV",
+                "wc_truth_0e",
+                "wc_truth_1e",
+                "wc_truth_0g",
+                "wc_truth_1g",
+                "wc_truth_2g",
+                "wc_truth_3plusg",
+                "wc_truth_0mu",
+                "wc_truth_1mu",
+                "wc_truth_Np",
+                "wc_truth_0p",
+                "wc_truth_nuPdg",
+                "wc_truth_isCC",
+            ]).head(5).iter_rows(named=True):
+                print(f"No-match example: {row}")
+        if num_multi_match > 0:
+            multi_match_df = all_df.filter(condition_match_count > 1).with_columns([
+                condition_match_count.alias("n_topological_matches")
+            ])
+            print("Multi-match by filetype (top 10):")
+            print(multi_match_df.group_by("filetype").len().sort("len", descending=True).head(10))
+            for row in multi_match_df.select([
+                "filename",
+                "filetype",
+                "run",
+                "subrun",
+                "event",
+                "n_topological_matches",
+            ]).head(5).iter_rows(named=True):
+                print(f"Multi-match example: {row}")
         raise AssertionError
     uncategorized_count = all_df.filter(pl.col('topological_signal_category') == -1).height
     if uncategorized_count > 0:
@@ -986,99 +1455,54 @@ def add_signal_categories(all_df):
         print(f"Error: Sum of filetype category counts ({sum(category_counts_unweighted)}) != total events ({total_events}), missing or overlapping categories?")
         raise AssertionError
 
+    print("Adding erin signal categories...")
+    erin_conditions = []
+    for query_text in erin_category_queries:
+        erin_conditions.append(eval(query_text, {'pl': pl, '__builtins__': {}}))
+    # assign integers to categories
+    erin_category_expr = None
+    for i, condition in enumerate(erin_conditions):
+        if erin_category_expr is None:
+            erin_category_expr = pl.when(condition).then(pl.lit(i))
+        else:
+            erin_category_expr = erin_category_expr.when(condition).then(pl.lit(i))
+    erin_category_expr = erin_category_expr.otherwise(pl.lit(-1))
+    all_df = all_df.with_columns([
+        erin_category_expr.alias("erin_signal_category")
+    ])
+    print("\nerin signal categories:")
+    category_counts_unweighted = []
+    category_counts_weighted = []
+    for erin_signal_category_i, erin_signal_category in enumerate(erin_category_labels):
+        curr_df = all_df.filter(pl.col('erin_signal_category') == erin_signal_category_i)
+        unweighted_num = curr_df.height
+        weighted_num = curr_df['wc_net_weight'].sum()
+        category_counts_unweighted.append(unweighted_num)
+        category_counts_weighted.append(weighted_num)
+        print(f"    {erin_signal_category}: {weighted_num:.2f} ({unweighted_num})")
+    total_events = all_df.height
+    uncategorized_count = all_df.filter(pl.col('erin_signal_category') == -1).height
+    if uncategorized_count > 0:
+        print(f"\nUncategorized erin signal categories ({uncategorized_count} events)!")
+        uncategorized_df = all_df.filter(pl.col('erin_signal_category') == -1)
+        # Print unique filetypes in uncategorized events
+        unique_filetypes = uncategorized_df['filetype'].unique().to_list()
+        print(f"Unique filetypes in uncategorized events: {unique_filetypes}")
+        # Print counts per filetype
+        for filetype in unique_filetypes:
+            count = uncategorized_df.filter(pl.col('filetype') == filetype).height
+            print(f"  {filetype}: {count} events")
+        row = uncategorized_df.row(0, named=True)
+        print(f"Example uncategorized event: {row['filename']=}, {row['filetype']=}, {row['run']=}, {row['subrun']=}, {row['event']=}, {row['wc_truth_inFV']=}, {row['wc_truth_Np']=}, {row['wc_truth_0mu']=}")
+        raise AssertionError
+    if sum(category_counts_unweighted) != total_events:
+        print(f"Error: Sum of erin category counts ({sum(category_counts_unweighted)}) != total events ({total_events}), missing or overlapping categories?")
+        raise AssertionError
+
+    print("finished adding signal categories")
+
     return all_df
 
-
-
-def do_blip_postprocessing(df):
-
-    # TODO: replace this blip analyzing code with a more detailed method or BDT according to Karan's studies
-
-    all_blip_x = df["blip_x"].to_numpy()
-    all_blip_y = df["blip_y"].to_numpy()
-    all_blip_z = df["blip_z"].to_numpy()
-    all_blip_energy = df["blip_energy"].to_numpy()
-    all_blip_dx = df["blip_dx"].to_numpy()
-    all_blip_dw = df["blip_dw"].to_numpy()
-    all_wc_reco_shower_momentum = df["wc_reco_showerMomentum"].to_numpy()
-    all_wc_reco_shower_vtx_x = df["wc_reco_showervtxX"].to_numpy()
-    all_wc_reco_shower_vtx_y = df["wc_reco_showervtxY"].to_numpy()
-    all_wc_reco_shower_vtx_z = df["wc_reco_showervtxZ"].to_numpy()
-
-    closest_upstream_blip_distance = []
-    closest_upstream_blip_angle = []
-    closest_upstream_blip_impact_parameter = []
-    closest_upstream_blip_energy = []
-    closest_upstream_blip_dx = []
-    closest_upstream_blip_dw = []
-    for event_index in tqdm(range(len(df)), desc="Finding closest upstream blip", mininterval=10):
-
-        curr_closest_upstream_blip_distance = np.inf
-        curr_closest_upstream_blip_angle = np.nan
-        curr_closest_upstream_blip_impact_parameter = np.nan
-        curr_closest_upstream_blip_energy = np.nan
-        curr_closest_upstream_blip_dx = np.nan
-        curr_closest_upstream_blip_dw = np.nan
-
-        blip_xs = all_blip_x[event_index]
-        blip_ys = all_blip_y[event_index]
-        blip_zs = all_blip_z[event_index]
-        blip_energies = all_blip_energy[event_index]
-        blip_dxs = all_blip_dx[event_index]
-        blip_dws = all_blip_dw[event_index]
-
-        # Check if wc_reco_shower_momentum is a float/NaN (not subscriptable)
-        if isinstance(all_wc_reco_shower_momentum[event_index], float) or not hasattr(all_wc_reco_shower_momentum[event_index], '__getitem__'):
-            closest_upstream_blip_distance.append(curr_closest_upstream_blip_distance)
-            closest_upstream_blip_angle.append(curr_closest_upstream_blip_angle)
-            closest_upstream_blip_impact_parameter.append(curr_closest_upstream_blip_impact_parameter)
-            closest_upstream_blip_energy.append(curr_closest_upstream_blip_energy)
-            closest_upstream_blip_dx.append(curr_closest_upstream_blip_dx)
-            closest_upstream_blip_dw.append(curr_closest_upstream_blip_dw)
-            continue
-
-        wc_reco_shower_momentum = np.array([all_wc_reco_shower_momentum[event_index][0], 
-                                            all_wc_reco_shower_momentum[event_index][1], 
-                                            all_wc_reco_shower_momentum[event_index][2]])
-        wc_reco_shower_momentum_unit = wc_reco_shower_momentum / np.linalg.norm(wc_reco_shower_momentum)
-        wc_reco_shower_vtx_x = all_wc_reco_shower_vtx_x[event_index]
-        wc_reco_shower_vtx_y = all_wc_reco_shower_vtx_y[event_index]
-        wc_reco_shower_vtx_z = all_wc_reco_shower_vtx_z[event_index]
-
-        for blip_index in range(len(blip_xs)):
-            dist_to_WC_shower_vtx = np.sqrt((blip_xs[blip_index] - wc_reco_shower_vtx_x)**2
-                                          + (blip_ys[blip_index] - wc_reco_shower_vtx_y)**2
-                                          + (blip_zs[blip_index] - wc_reco_shower_vtx_z)**2)
-            threshold_dist = 2 # cm, must be at least 2 cm away to be considered upstream
-            shower_vtx_to_blip_vector = np.array([blip_xs[blip_index] - wc_reco_shower_vtx_x,
-                                        blip_ys[blip_index] - wc_reco_shower_vtx_y,
-                                        blip_zs[blip_index] - wc_reco_shower_vtx_z])
-            shower_vtx_to_blip_vector_unit = shower_vtx_to_blip_vector / np.linalg.norm(shower_vtx_to_blip_vector)
-            dot_product = np.dot(shower_vtx_to_blip_vector_unit, -wc_reco_shower_momentum_unit)
-            dot_product = np.clip(dot_product, -1.0, 1.0) # accounting for floating point errors near 1 or -1
-            blip_angle = np.arccos(dot_product) * 180 / np.pi # angle between vtx to blip vector and backwards shower momentum vector
-            if threshold_dist < dist_to_WC_shower_vtx < curr_closest_upstream_blip_distance and blip_angle < 90:
-                curr_closest_upstream_blip_distance = dist_to_WC_shower_vtx
-                curr_closest_upstream_blip_angle = blip_angle
-                curr_projected_vec = np.dot(shower_vtx_to_blip_vector, wc_reco_shower_momentum_unit) * wc_reco_shower_momentum_unit # vtx to blip vector projected along shower axis
-                curr_closest_upstream_blip_impact_parameter = np.linalg.norm(shower_vtx_to_blip_vector - curr_projected_vec)
-                curr_closest_upstream_blip_energy = blip_energies[blip_index]
-                curr_closest_upstream_blip_dx = blip_dxs[blip_index]
-                curr_closest_upstream_blip_dw = blip_dws[blip_index]
-        closest_upstream_blip_distance.append(curr_closest_upstream_blip_distance)
-        closest_upstream_blip_angle.append(curr_closest_upstream_blip_angle)
-        closest_upstream_blip_impact_parameter.append(curr_closest_upstream_blip_impact_parameter)
-        closest_upstream_blip_energy.append(curr_closest_upstream_blip_energy)
-        closest_upstream_blip_dx.append(curr_closest_upstream_blip_dx)
-        closest_upstream_blip_dw.append(curr_closest_upstream_blip_dw)
-    df["blip_closest_upstream_distance"] = closest_upstream_blip_distance
-    df["blip_closest_upstream_angle"] = closest_upstream_blip_angle
-    df["blip_closest_upstream_impact_parameter"] = closest_upstream_blip_impact_parameter
-    df["blip_closest_upstream_energy"] = closest_upstream_blip_energy
-    df["blip_closest_upstream_dx"] = closest_upstream_blip_dx
-    df["blip_closest_upstream_dw"] = closest_upstream_blip_dw
-    
-    return df
 
 def do_pandora_postprocessing(df):
 
@@ -1096,10 +1520,10 @@ def do_pandora_postprocessing(df):
 
         curr_event_processed_var_dic = {}
 
-        for var in pandora_vector_vars_with_prefix:
-            curr_event_processed_var_dic[f"pandora_max3_len_trk_{var[8:]}"] = np.nan
-            curr_event_processed_var_dic[f"pandora_max2_len_trk_{var[8:]}"] = np.nan
-            curr_event_processed_var_dic[f"pandora_max_len_trk_{var[8:]}"] = np.nan
+        for var in pandora_vector_vars:
+            curr_event_processed_var_dic[f"pandora_max3_len_trk_{var}"] = np.nan
+            curr_event_processed_var_dic[f"pandora_max2_len_trk_{var}"] = np.nan
+            curr_event_processed_var_dic[f"pandora_max_len_trk_{var}"] = np.nan
         
         max_pfp_len = 0
         max2_pfp_len = -1
@@ -1107,17 +1531,17 @@ def do_pandora_postprocessing(df):
         for pfp_i in range(len(curr_event_vector_var_dic[pandora_vector_vars_with_prefix[0]])):
             curr_pfp_len = curr_event_vector_var_dic["pandora_trk_len_v"][pfp_i]
             if curr_pfp_len > max_pfp_len:
-                for var in pandora_vector_vars_with_prefix:
-                    curr_event_processed_var_dic[f"pandora_max3_len_trk_{var[8:]}"] = curr_event_processed_var_dic[f"pandora_max2_len_trk_{var[8:]}"]
-                    curr_event_processed_var_dic[f"pandora_max2_len_trk_{var[8:]}"] = curr_event_processed_var_dic[f"pandora_max_len_trk_{var[8:]}"]
-                    curr_event_processed_var_dic[f"pandora_max_len_trk_{var[8:]}"] = curr_event_vector_var_dic[var][pfp_i]
+                for var in pandora_vector_vars:
+                    curr_event_processed_var_dic[f"pandora_max3_len_trk_{var}"] = curr_event_processed_var_dic[f"pandora_max2_len_trk_{var}"]
+                    curr_event_processed_var_dic[f"pandora_max2_len_trk_{var}"] = curr_event_processed_var_dic[f"pandora_max_len_trk_{var}"]
+                    curr_event_processed_var_dic[f"pandora_max_len_trk_{var}"] = curr_event_vector_var_dic[f"pandora_{var}"][pfp_i]
             elif curr_pfp_len > max2_pfp_len:
-                for var in pandora_vector_vars_with_prefix:
-                    curr_event_processed_var_dic[f"pandora_max3_len_trk_{var[8:]}"] = curr_event_processed_var_dic[f"pandora_max2_len_trk_{var[8:]}"]
-                    curr_event_processed_var_dic[f"pandora_max2_len_trk_{var[8:]}"] = curr_event_vector_var_dic[var][pfp_i]
+                for var in pandora_vector_vars:
+                    curr_event_processed_var_dic[f"pandora_max3_len_trk_{var}"] = curr_event_processed_var_dic[f"pandora_max2_len_trk_{var}"]
+                    curr_event_processed_var_dic[f"pandora_max2_len_trk_{var}"] = curr_event_vector_var_dic[f"pandora_{var}"][pfp_i]
             elif curr_pfp_len > max3_pfp_len:
-                for var in pandora_vector_vars_with_prefix:
-                    curr_event_processed_var_dic[f"pandora_max_len_trk_{var[8:]}"] = curr_event_vector_var_dic[var][pfp_i]
+                for var in pandora_vector_vars:
+                    curr_event_processed_var_dic[f"pandora_max_len_trk_{var}"] = curr_event_vector_var_dic[f"pandora_{var}"][pfp_i]
         
         for processed_var in curr_event_processed_var_dic.keys():
             processed_var_dic[processed_var].append(curr_event_processed_var_dic[processed_var])
@@ -1125,11 +1549,10 @@ def do_pandora_postprocessing(df):
     return pd.concat([df, pd.DataFrame(processed_var_dic)], axis=1)
 
 
-
 def do_glee_postprocessing(df):
 
-    isolation_min_dist_trk_shr = df["glee_isolation_min_dist_trk_shr"].to_numpy()
     isolation_min_dist_trk_unassoc = df["glee_isolation_min_dist_trk_unassoc"].to_numpy()
+    isolation_min_dist_trk_shr = df["glee_isolation_min_dist_trk_shr"].to_numpy()
     isolation_nearest_shr_hit_to_trk_time = df["glee_isolation_nearest_shr_hit_to_trk_time"].to_numpy()
     isolation_nearest_shr_hit_to_trk_wire = df["glee_isolation_nearest_shr_hit_to_trk_wire"].to_numpy()
     isolation_nearest_unassoc_hit_to_trk_time = df["glee_isolation_nearest_unassoc_hit_to_trk_time"].to_numpy()
@@ -1142,9 +1565,8 @@ def do_glee_postprocessing(df):
     isolation_num_unassoc_hits_win_1cm_trk = df["glee_isolation_num_unassoc_hits_win_1cm_trk"].to_numpy()
     isolation_num_unassoc_hits_win_2cm_trk = df["glee_isolation_num_unassoc_hits_win_2cm_trk"].to_numpy()
     isolation_num_unassoc_hits_win_5cm_trk = df["glee_isolation_num_unassoc_hits_win_5cm_trk"].to_numpy()
-
-    min_isolation_min_dist_trk_shr = []
     min_isolation_min_dist_trk_unassoc = []
+    min_isolation_min_dist_trk_shr = []
     min_isolation_nearest_shr_hit_to_trk_time = []
     min_isolation_nearest_shr_hit_to_trk_wire = []
     min_isolation_nearest_unassoc_hit_to_trk_time = []
@@ -1157,74 +1579,524 @@ def do_glee_postprocessing(df):
     sum_isolation_num_unassoc_hits_win_1cm_trk = []
     sum_isolation_num_unassoc_hits_win_2cm_trk = []
     sum_isolation_num_unassoc_hits_win_5cm_trk = []
-
     for event_i in tqdm(range(len(isolation_min_dist_trk_shr)), desc="Analyzing gLEE isolation variables", mininterval=10):
-        curr_isolation_min_dist_trk_shr = isolation_min_dist_trk_shr[event_i]
-        if isinstance(curr_isolation_min_dist_trk_shr, (float, np.floating)) or not hasattr(curr_isolation_min_dist_trk_shr, '__len__'):
-            # It's a scalar, treat as empty list (will append NaN values)
-            min_isolation_min_dist_trk_shr.append(np.nan)
-            min_isolation_min_dist_trk_unassoc.append(np.nan)
-            min_isolation_nearest_shr_hit_to_trk_time.append(np.nan)
-            min_isolation_nearest_shr_hit_to_trk_wire.append(np.nan)
-            min_isolation_nearest_unassoc_hit_to_trk_time.append(np.nan)
-            min_isolation_nearest_unassoc_hit_to_trk_wire.append(np.nan)
-            sum_isolation_num_shr_hits_win_10cm_trk.append(np.nan)
-            sum_isolation_num_shr_hits_win_1cm_trk.append(np.nan)
-            sum_isolation_num_shr_hits_win_2cm_trk.append(np.nan)
-            sum_isolation_num_shr_hits_win_5cm_trk.append(np.nan)
-            sum_isolation_num_unassoc_hits_win_10cm_trk.append(np.nan)
-            sum_isolation_num_unassoc_hits_win_1cm_trk.append(np.nan)
-            sum_isolation_num_unassoc_hits_win_2cm_trk.append(np.nan)
-            sum_isolation_num_unassoc_hits_win_5cm_trk.append(np.nan)
-            continue
-        if len(isolation_min_dist_trk_shr[event_i]) == 0:
-            min_isolation_min_dist_trk_shr.append(np.nan)
-            min_isolation_min_dist_trk_unassoc.append(np.nan)
-            min_isolation_nearest_shr_hit_to_trk_time.append(np.nan)
-            min_isolation_nearest_shr_hit_to_trk_wire.append(np.nan)
-            min_isolation_nearest_unassoc_hit_to_trk_time.append(np.nan)
-            min_isolation_nearest_unassoc_hit_to_trk_wire.append(np.nan)
-            sum_isolation_num_shr_hits_win_10cm_trk.append(np.nan)
-            sum_isolation_num_shr_hits_win_1cm_trk.append(np.nan)
-            sum_isolation_num_shr_hits_win_2cm_trk.append(np.nan)
-            sum_isolation_num_shr_hits_win_5cm_trk.append(np.nan)
-            sum_isolation_num_unassoc_hits_win_10cm_trk.append(np.nan)
-            sum_isolation_num_unassoc_hits_win_1cm_trk.append(np.nan)
-            sum_isolation_num_unassoc_hits_win_2cm_trk.append(np.nan)
-            sum_isolation_num_unassoc_hits_win_5cm_trk.append(np.nan)
-        else:
-            min_isolation_min_dist_trk_shr.append(np.min(isolation_min_dist_trk_shr[event_i]))
-            min_isolation_min_dist_trk_unassoc.append(np.min(isolation_min_dist_trk_unassoc[event_i]))
-            min_isolation_nearest_shr_hit_to_trk_time.append(np.min(isolation_nearest_shr_hit_to_trk_time[event_i]))
-            min_isolation_nearest_shr_hit_to_trk_wire.append(np.min(isolation_nearest_shr_hit_to_trk_wire[event_i]))
-            min_isolation_nearest_unassoc_hit_to_trk_time.append(np.min(isolation_nearest_unassoc_hit_to_trk_time[event_i]))
-            min_isolation_nearest_unassoc_hit_to_trk_wire.append(np.min(isolation_nearest_unassoc_hit_to_trk_wire[event_i]))
-            sum_isolation_num_shr_hits_win_10cm_trk.append(np.sum(isolation_num_shr_hits_win_10cm_trk[event_i]))
-            sum_isolation_num_shr_hits_win_1cm_trk.append(np.sum(isolation_num_shr_hits_win_1cm_trk[event_i]))
-            sum_isolation_num_shr_hits_win_2cm_trk.append(np.sum(isolation_num_shr_hits_win_2cm_trk[event_i]))
-            sum_isolation_num_shr_hits_win_5cm_trk.append(np.sum(isolation_num_shr_hits_win_5cm_trk[event_i]))
-            sum_isolation_num_unassoc_hits_win_10cm_trk.append(np.sum(isolation_num_unassoc_hits_win_10cm_trk[event_i]))
-            sum_isolation_num_unassoc_hits_win_1cm_trk.append(np.sum(isolation_num_unassoc_hits_win_1cm_trk[event_i]))
-            sum_isolation_num_unassoc_hits_win_2cm_trk.append(np.sum(isolation_num_unassoc_hits_win_2cm_trk[event_i]))
-            sum_isolation_num_unassoc_hits_win_5cm_trk.append(np.sum(isolation_num_unassoc_hits_win_5cm_trk[event_i]))
-
+        min_dist = 1e9
+        curr_min_isolation_min_dist_trk_unassoc = np.nan
+        curr_min_isolation_min_dist_trk_shr = np.nan
+        curr_min_isolation_nearest_shr_hit_to_trk_time = np.nan
+        curr_min_isolation_nearest_shr_hit_to_trk_wire = np.nan
+        curr_min_isolation_nearest_unassoc_hit_to_trk_time = np.nan
+        curr_min_isolation_nearest_unassoc_hit_to_trk_wire = np.nan
+        curr_sum_isolation_num_shr_hits_win_10cm_trk = np.nan
+        curr_sum_isolation_num_shr_hits_win_1cm_trk = np.nan
+        curr_sum_isolation_num_shr_hits_win_2cm_trk = np.nan
+        curr_sum_isolation_num_shr_hits_win_5cm_trk = np.nan
+        curr_sum_isolation_num_unassoc_hits_win_10cm_trk = np.nan
+        curr_sum_isolation_num_unassoc_hits_win_1cm_trk = np.nan
+        curr_sum_isolation_num_unassoc_hits_win_2cm_trk = np.nan
+        curr_sum_isolation_num_unassoc_hits_win_5cm_trk = np.nan
+        # ensuring we have a non-empty list of unassoc hits that we can loop over
+        temp_list = isolation_min_dist_trk_unassoc[event_i]
+        if not (isinstance(temp_list, (float, np.floating)) or not hasattr(temp_list, '__len__') or len(temp_list) == 0): 
+            # looping over all unassoc hits
+            for unassoc_hit_j in range(len(temp_list)):
+                # saving values for the closest unassoc hit to the track
+                if isolation_min_dist_trk_unassoc[event_i][unassoc_hit_j] < min_dist:
+                    min_dist = isolation_min_dist_trk_unassoc[event_i][unassoc_hit_j]
+                    curr_min_isolation_min_dist_trk_unassoc = isolation_min_dist_trk_unassoc[event_i][unassoc_hit_j]
+                    curr_min_isolation_min_dist_trk_shr = isolation_min_dist_trk_shr[event_i][unassoc_hit_j]
+                    curr_min_isolation_nearest_shr_hit_to_trk_time = isolation_nearest_shr_hit_to_trk_time[event_i][unassoc_hit_j]
+                    curr_min_isolation_nearest_shr_hit_to_trk_wire = isolation_nearest_shr_hit_to_trk_wire[event_i][unassoc_hit_j]
+                    curr_min_isolation_nearest_unassoc_hit_to_trk_time = isolation_nearest_unassoc_hit_to_trk_time[event_i][unassoc_hit_j]
+                    curr_min_isolation_nearest_unassoc_hit_to_trk_wire = isolation_nearest_unassoc_hit_to_trk_wire[event_i][unassoc_hit_j]
+                    curr_sum_isolation_num_shr_hits_win_10cm_trk = isolation_num_shr_hits_win_10cm_trk[event_i][unassoc_hit_j]
+                    curr_sum_isolation_num_shr_hits_win_1cm_trk = isolation_num_shr_hits_win_1cm_trk[event_i][unassoc_hit_j]
+                    curr_sum_isolation_num_shr_hits_win_2cm_trk = isolation_num_shr_hits_win_2cm_trk[event_i][unassoc_hit_j]
+                    curr_sum_isolation_num_shr_hits_win_5cm_trk = isolation_num_shr_hits_win_5cm_trk[event_i][unassoc_hit_j]
+                    curr_sum_isolation_num_unassoc_hits_win_10cm_trk = isolation_num_unassoc_hits_win_10cm_trk[event_i][unassoc_hit_j]
+                    curr_sum_isolation_num_unassoc_hits_win_1cm_trk = isolation_num_unassoc_hits_win_1cm_trk[event_i][unassoc_hit_j]
+                    curr_sum_isolation_num_unassoc_hits_win_2cm_trk = isolation_num_unassoc_hits_win_2cm_trk[event_i][unassoc_hit_j]
+                    curr_sum_isolation_num_unassoc_hits_win_5cm_trk = isolation_num_unassoc_hits_win_5cm_trk[event_i][unassoc_hit_j]
+        min_isolation_min_dist_trk_unassoc.append(curr_min_isolation_min_dist_trk_unassoc)
+        min_isolation_min_dist_trk_shr.append(curr_min_isolation_min_dist_trk_shr)
+        min_isolation_nearest_shr_hit_to_trk_time.append(curr_min_isolation_nearest_shr_hit_to_trk_time)
+        min_isolation_nearest_shr_hit_to_trk_wire.append(curr_min_isolation_nearest_shr_hit_to_trk_wire)
+        min_isolation_nearest_unassoc_hit_to_trk_time.append(curr_min_isolation_nearest_unassoc_hit_to_trk_time)
+        min_isolation_nearest_unassoc_hit_to_trk_wire.append(curr_min_isolation_nearest_unassoc_hit_to_trk_wire)
+        sum_isolation_num_shr_hits_win_10cm_trk.append(curr_sum_isolation_num_shr_hits_win_10cm_trk)
+        sum_isolation_num_shr_hits_win_1cm_trk.append(curr_sum_isolation_num_shr_hits_win_1cm_trk)
+        sum_isolation_num_shr_hits_win_2cm_trk.append(curr_sum_isolation_num_shr_hits_win_2cm_trk)
+        sum_isolation_num_shr_hits_win_5cm_trk.append(curr_sum_isolation_num_shr_hits_win_5cm_trk)
+        sum_isolation_num_unassoc_hits_win_10cm_trk.append(curr_sum_isolation_num_unassoc_hits_win_10cm_trk)
+        sum_isolation_num_unassoc_hits_win_1cm_trk.append(curr_sum_isolation_num_unassoc_hits_win_1cm_trk)
+        sum_isolation_num_unassoc_hits_win_2cm_trk.append(curr_sum_isolation_num_unassoc_hits_win_2cm_trk)
+        sum_isolation_num_unassoc_hits_win_5cm_trk.append(curr_sum_isolation_num_unassoc_hits_win_5cm_trk)
     glee_isolation_df = pd.DataFrame({
-        "glee_min_isolation_min_dist_trk_shr": min_isolation_min_dist_trk_shr,
-        "glee_min_isolation_min_dist_trk_unassoc": min_isolation_min_dist_trk_unassoc,
-        "glee_min_isolation_nearest_shr_hit_to_trk_time": min_isolation_nearest_shr_hit_to_trk_time,
-        "glee_min_isolation_nearest_shr_hit_to_trk_wire": min_isolation_nearest_shr_hit_to_trk_wire,
-        "glee_min_isolation_nearest_unassoc_hit_to_trk_time": min_isolation_nearest_unassoc_hit_to_trk_time,
-        "glee_min_isolation_nearest_unassoc_hit_to_trk_wire": min_isolation_nearest_unassoc_hit_to_trk_wire,
-        "glee_sum_isolation_num_shr_hits_win_10cm_trk": sum_isolation_num_shr_hits_win_10cm_trk,
-        "glee_sum_isolation_num_shr_hits_win_1cm_trk": sum_isolation_num_shr_hits_win_1cm_trk,
-        "glee_sum_isolation_num_shr_hits_win_2cm_trk": sum_isolation_num_shr_hits_win_2cm_trk,
-        "glee_sum_isolation_num_shr_hits_win_5cm_trk": sum_isolation_num_shr_hits_win_5cm_trk,
-        "glee_sum_isolation_num_unassoc_hits_win_10cm_trk": sum_isolation_num_unassoc_hits_win_10cm_trk,
-        "glee_sum_isolation_num_unassoc_hits_win_1cm_trk": sum_isolation_num_unassoc_hits_win_1cm_trk,
-        "glee_sum_isolation_num_unassoc_hits_win_2cm_trk": sum_isolation_num_unassoc_hits_win_2cm_trk,
-        "glee_sum_isolation_num_unassoc_hits_win_5cm_trk": sum_isolation_num_unassoc_hits_win_5cm_trk,
+        "glee_dist_ranked_isolation_min_dist_trk_unassoc": min_isolation_min_dist_trk_unassoc,
+        "glee_dist_ranked_isolation_min_dist_trk_shr": min_isolation_min_dist_trk_shr,
+        "glee_dist_ranked_isolation_nearest_shr_hit_to_trk_time": min_isolation_nearest_shr_hit_to_trk_time,
+        "glee_dist_ranked_isolation_nearest_shr_hit_to_trk_wire": min_isolation_nearest_shr_hit_to_trk_wire,
+        "glee_dist_ranked_isolation_nearest_unassoc_hit_to_trk_time": min_isolation_nearest_unassoc_hit_to_trk_time,
+        "glee_dist_ranked_isolation_nearest_unassoc_hit_to_trk_wire": min_isolation_nearest_unassoc_hit_to_trk_wire,
+        "glee_dist_ranked_isolation_num_shr_hits_win_10cm_trk": sum_isolation_num_shr_hits_win_10cm_trk,
+        "glee_dist_ranked_isolation_num_shr_hits_win_1cm_trk": sum_isolation_num_shr_hits_win_1cm_trk,
+        "glee_dist_ranked_isolation_num_shr_hits_win_2cm_trk": sum_isolation_num_shr_hits_win_2cm_trk,
+        "glee_dist_ranked_isolation_num_shr_hits_win_5cm_trk": sum_isolation_num_shr_hits_win_5cm_trk,
+        "glee_dist_ranked_isolation_num_unassoc_hits_win_10cm_trk": sum_isolation_num_unassoc_hits_win_10cm_trk,
+        "glee_dist_ranked_isolation_num_unassoc_hits_win_1cm_trk": sum_isolation_num_unassoc_hits_win_1cm_trk,
+        "glee_dist_ranked_isolation_num_unassoc_hits_win_2cm_trk": sum_isolation_num_unassoc_hits_win_2cm_trk,
+        "glee_dist_ranked_isolation_num_unassoc_hits_win_5cm_trk": sum_isolation_num_unassoc_hits_win_5cm_trk,
     }, index=df.index)
-    df = pd.concat([df, glee_isolation_df], axis=1)
+
+    trackstub_candidate_in_nu_slice = df["glee_trackstub_candidate_in_nu_slice"].to_numpy()
+    trackstub_candidate_num_hits = df["glee_trackstub_candidate_num_hits"].to_numpy()
+    trackstub_candidate_num_wires = df["glee_trackstub_candidate_num_wires"].to_numpy()
+    trackstub_candidate_num_ticks = df["glee_trackstub_candidate_num_ticks"].to_numpy()
+    trackstub_candidate_plane = df["glee_trackstub_candidate_plane"].to_numpy()
+    trackstub_candidate_PCA = df["glee_trackstub_candidate_PCA"].to_numpy()
+    trackstub_candidate_mean_ADC = df["glee_trackstub_candidate_mean_ADC"].to_numpy()
+    trackstub_candidate_ADC_RMS = df["glee_trackstub_candidate_ADC_RMS"].to_numpy()
+    trackstub_candidate_min_dist = df["glee_trackstub_candidate_min_dist"].to_numpy()
+    trackstub_candidate_min_impact_parameter_to_shower = df["glee_trackstub_candidate_min_impact_parameter_to_shower"].to_numpy()
+    trackstub_candidate_min_conversion_dist_to_shower_start = df["glee_trackstub_candidate_min_conversion_dist_to_shower_start"].to_numpy()
+    trackstub_candidate_min_ioc_to_shower_start = df["glee_trackstub_candidate_min_ioc_to_shower_start"].to_numpy()
+    trackstub_candidate_ioc_based_length = df["glee_trackstub_candidate_ioc_based_length"].to_numpy()
+    trackstub_candidate_wire_tick_based_length = df["glee_trackstub_candidate_wire_tick_based_length"].to_numpy()
+    trackstub_candidate_mean_ADC_first_half = df["glee_trackstub_candidate_mean_ADC_first_half"].to_numpy()
+    trackstub_candidate_mean_ADC_second_half = df["glee_trackstub_candidate_mean_ADC_second_half"].to_numpy()
+    trackstub_candidate_mean_ADC_first_to_second_ratio = df["glee_trackstub_candidate_mean_ADC_first_to_second_ratio"].to_numpy()
+    trackstub_candidate_track_angle_wrt_shower_direction = df["glee_trackstub_candidate_track_angle_wrt_shower_direction"].to_numpy()
+    trackstub_candidate_linear_fit_chi2 = df["glee_trackstub_candidate_linear_fit_chi2"].to_numpy()
+    trackstub_candidate_energy = df["glee_trackstub_candidate_energy"].to_numpy()
+
+    dist_ranked_trackstub_candidate_in_nu_slice = []
+    dist_ranked_trackstub_candidate_num_hits = []
+    dist_ranked_trackstub_candidate_num_wires = []
+    dist_ranked_trackstub_candidate_num_ticks = []
+    dist_ranked_trackstub_candidate_plane = []
+    dist_ranked_trackstub_candidate_PCA = []
+    dist_ranked_trackstub_candidate_mean_ADC = []
+    dist_ranked_trackstub_candidate_ADC_RMS = []
+    dist_ranked_trackstub_candidate_min_dist = []
+    dist_ranked_trackstub_candidate_min_impact_parameter_to_shower = []
+    dist_ranked_trackstub_candidate_min_conversion_dist_to_shower_start = []
+    dist_ranked_trackstub_candidate_min_ioc_to_shower_start = []
+    dist_ranked_trackstub_candidate_ioc_based_length = []
+    dist_ranked_trackstub_candidate_wire_tick_based_length = []
+    dist_ranked_trackstub_candidate_mean_ADC_first_half = []
+    dist_ranked_trackstub_candidate_mean_ADC_second_half = []
+    dist_ranked_trackstub_candidate_mean_ADC_first_to_second_ratio = []
+    dist_ranked_trackstub_candidate_track_angle_wrt_shower_direction = []
+    dist_ranked_trackstub_candidate_linear_fit_chi2 = []
+    dist_ranked_trackstub_candidate_energy = []
+    energy_ranked_trackstub_candidate_in_nu_slice = []
+    energy_ranked_trackstub_candidate_num_hits = []
+    energy_ranked_trackstub_candidate_num_wires = []
+    energy_ranked_trackstub_candidate_num_ticks = []
+    energy_ranked_trackstub_candidate_plane = []
+    energy_ranked_trackstub_candidate_PCA = []
+    energy_ranked_trackstub_candidate_mean_ADC = []
+    energy_ranked_trackstub_candidate_ADC_RMS = []
+    energy_ranked_trackstub_candidate_min_dist = []
+    energy_ranked_trackstub_candidate_min_impact_parameter_to_shower = []
+    energy_ranked_trackstub_candidate_min_conversion_dist_to_shower_start = []
+    energy_ranked_trackstub_candidate_min_ioc_to_shower_start = []
+    energy_ranked_trackstub_candidate_ioc_based_length = []
+    energy_ranked_trackstub_candidate_wire_tick_based_length = []
+    energy_ranked_trackstub_candidate_mean_ADC_first_half = []
+    energy_ranked_trackstub_candidate_mean_ADC_second_half = []
+    energy_ranked_trackstub_candidate_mean_ADC_first_to_second_ratio = []
+    energy_ranked_trackstub_candidate_track_angle_wrt_shower_direction = []
+    energy_ranked_trackstub_candidate_linear_fit_chi2 = []
+    energy_ranked_trackstub_candidate_energy = []
+    conv_ranked_trackstub_candidate_in_nu_slice = []
+    conv_ranked_trackstub_candidate_num_hits = []
+    conv_ranked_trackstub_candidate_num_wires = []
+    conv_ranked_trackstub_candidate_num_ticks = []
+    conv_ranked_trackstub_candidate_plane = []
+    conv_ranked_trackstub_candidate_PCA = []
+    conv_ranked_trackstub_candidate_mean_ADC = []
+    conv_ranked_trackstub_candidate_ADC_RMS = []
+    conv_ranked_trackstub_candidate_min_dist = []
+    conv_ranked_trackstub_candidate_min_impact_parameter_to_shower = []
+    conv_ranked_trackstub_candidate_min_conversion_dist_to_shower_start = []
+    conv_ranked_trackstub_candidate_min_ioc_to_shower_start = []
+    conv_ranked_trackstub_candidate_ioc_based_length = []
+    conv_ranked_trackstub_candidate_wire_tick_based_length = []
+    conv_ranked_trackstub_candidate_mean_ADC_first_half = []
+    conv_ranked_trackstub_candidate_mean_ADC_second_half = []
+    conv_ranked_trackstub_candidate_mean_ADC_first_to_second_ratio = []
+    conv_ranked_trackstub_candidate_track_angle_wrt_shower_direction = []
+    conv_ranked_trackstub_candidate_linear_fit_chi2 = []
+    conv_ranked_trackstub_candidate_energy = []
+    impact_param_ranked_trackstub_candidate_in_nu_slice = []
+    impact_param_ranked_trackstub_candidate_num_hits = []
+    impact_param_ranked_trackstub_candidate_num_wires = []
+    impact_param_ranked_trackstub_candidate_num_ticks = []
+    impact_param_ranked_trackstub_candidate_plane = []
+    impact_param_ranked_trackstub_candidate_PCA = []
+    impact_param_ranked_trackstub_candidate_mean_ADC = []
+    impact_param_ranked_trackstub_candidate_ADC_RMS = []
+    impact_param_ranked_trackstub_candidate_min_dist = []
+    impact_param_ranked_trackstub_candidate_min_impact_parameter_to_shower = []
+    impact_param_ranked_trackstub_candidate_min_conversion_dist_to_shower_start = []
+    impact_param_ranked_trackstub_candidate_min_ioc_to_shower_start = []
+    impact_param_ranked_trackstub_candidate_ioc_based_length = []
+    impact_param_ranked_trackstub_candidate_wire_tick_based_length = []
+    impact_param_ranked_trackstub_candidate_mean_ADC_first_half = []
+    impact_param_ranked_trackstub_candidate_mean_ADC_second_half = []
+    impact_param_ranked_trackstub_candidate_mean_ADC_first_to_second_ratio = []
+    impact_param_ranked_trackstub_candidate_track_angle_wrt_shower_direction = []
+    impact_param_ranked_trackstub_candidate_linear_fit_chi2 = []
+    impact_param_ranked_trackstub_candidate_energy = []
+    for event_i in tqdm(range(len(trackstub_candidate_in_nu_slice)), desc="Analyzing gLEE trackstub variables", mininterval=10):
+        min_dist = 1e9
+        max_energy = 0
+        min_conv = 1e9
+        min_impact_param = 1e9
+        curr_dist_ranked_trackstub_candidate_in_nu_slice = np.nan
+        curr_dist_ranked_trackstub_candidate_num_hits = np.nan
+        curr_dist_ranked_trackstub_candidate_num_wires = np.nan
+        curr_dist_ranked_trackstub_candidate_num_ticks = np.nan
+        curr_dist_ranked_trackstub_candidate_plane = np.nan
+        curr_dist_ranked_trackstub_candidate_PCA = np.nan
+        curr_dist_ranked_trackstub_candidate_mean_ADC = np.nan
+        curr_dist_ranked_trackstub_candidate_ADC_RMS = np.nan
+        curr_dist_ranked_trackstub_candidate_min_dist = np.nan
+        curr_dist_ranked_trackstub_candidate_min_impact_parameter_to_shower = np.nan
+        curr_dist_ranked_trackstub_candidate_min_conversion_dist_to_shower_start = np.nan
+        curr_dist_ranked_trackstub_candidate_min_ioc_to_shower_start = np.nan
+        curr_dist_ranked_trackstub_candidate_ioc_based_length = np.nan
+        curr_dist_ranked_trackstub_candidate_wire_tick_based_length = np.nan
+        curr_dist_ranked_trackstub_candidate_mean_ADC_first_half = np.nan
+        curr_dist_ranked_trackstub_candidate_mean_ADC_second_half = np.nan
+        curr_dist_ranked_trackstub_candidate_mean_ADC_first_to_second_ratio = np.nan
+        curr_dist_ranked_trackstub_candidate_track_angle_wrt_shower_direction = np.nan
+        curr_dist_ranked_trackstub_candidate_linear_fit_chi2 = np.nan
+        curr_dist_ranked_trackstub_candidate_energy = np.nan
+        curr_energy_ranked_trackstub_candidate_in_nu_slice = np.nan
+        curr_energy_ranked_trackstub_candidate_num_hits = np.nan
+        curr_energy_ranked_trackstub_candidate_num_wires = np.nan
+        curr_energy_ranked_trackstub_candidate_num_ticks = np.nan
+        curr_energy_ranked_trackstub_candidate_plane = np.nan
+        curr_energy_ranked_trackstub_candidate_PCA = np.nan
+        curr_energy_ranked_trackstub_candidate_mean_ADC = np.nan
+        curr_energy_ranked_trackstub_candidate_ADC_RMS = np.nan
+        curr_energy_ranked_trackstub_candidate_min_dist = np.nan
+        curr_energy_ranked_trackstub_candidate_min_impact_parameter_to_shower = np.nan
+        curr_energy_ranked_trackstub_candidate_min_conversion_dist_to_shower_start = np.nan
+        curr_energy_ranked_trackstub_candidate_min_ioc_to_shower_start = np.nan
+        curr_energy_ranked_trackstub_candidate_ioc_based_length = np.nan
+        curr_energy_ranked_trackstub_candidate_wire_tick_based_length = np.nan
+        curr_energy_ranked_trackstub_candidate_mean_ADC_first_half = np.nan
+        curr_energy_ranked_trackstub_candidate_mean_ADC_second_half = np.nan
+        curr_energy_ranked_trackstub_candidate_mean_ADC_first_to_second_ratio = np.nan
+        curr_energy_ranked_trackstub_candidate_track_angle_wrt_shower_direction = np.nan
+        curr_energy_ranked_trackstub_candidate_linear_fit_chi2 = np.nan
+        curr_energy_ranked_trackstub_candidate_energy = np.nan
+        curr_conv_ranked_trackstub_candidate_in_nu_slice = np.nan
+        curr_conv_ranked_trackstub_candidate_num_hits = np.nan
+        curr_conv_ranked_trackstub_candidate_num_wires = np.nan
+        curr_conv_ranked_trackstub_candidate_num_ticks = np.nan
+        curr_conv_ranked_trackstub_candidate_plane = np.nan
+        curr_conv_ranked_trackstub_candidate_PCA = np.nan
+        curr_conv_ranked_trackstub_candidate_mean_ADC = np.nan
+        curr_conv_ranked_trackstub_candidate_ADC_RMS = np.nan
+        curr_conv_ranked_trackstub_candidate_min_dist = np.nan
+        curr_conv_ranked_trackstub_candidate_min_impact_parameter_to_shower = np.nan
+        curr_conv_ranked_trackstub_candidate_min_conversion_dist_to_shower_start = np.nan
+        curr_conv_ranked_trackstub_candidate_min_ioc_to_shower_start = np.nan
+        curr_conv_ranked_trackstub_candidate_ioc_based_length = np.nan
+        curr_conv_ranked_trackstub_candidate_wire_tick_based_length = np.nan
+        curr_conv_ranked_trackstub_candidate_mean_ADC_first_half = np.nan
+        curr_conv_ranked_trackstub_candidate_mean_ADC_second_half = np.nan
+        curr_conv_ranked_trackstub_candidate_mean_ADC_first_to_second_ratio = np.nan
+        curr_conv_ranked_trackstub_candidate_track_angle_wrt_shower_direction = np.nan
+        curr_conv_ranked_trackstub_candidate_linear_fit_chi2 = np.nan
+        curr_conv_ranked_trackstub_candidate_energy = np.nan
+        curr_impact_param_ranked_trackstub_candidate_in_nu_slice = np.nan
+        curr_impact_param_ranked_trackstub_candidate_num_hits = np.nan
+        curr_impact_param_ranked_trackstub_candidate_num_wires = np.nan
+        curr_impact_param_ranked_trackstub_candidate_num_ticks = np.nan
+        curr_impact_param_ranked_trackstub_candidate_plane = np.nan
+        curr_impact_param_ranked_trackstub_candidate_PCA = np.nan
+        curr_impact_param_ranked_trackstub_candidate_mean_ADC = np.nan
+        curr_impact_param_ranked_trackstub_candidate_ADC_RMS = np.nan
+        curr_impact_param_ranked_trackstub_candidate_min_dist = np.nan
+        curr_impact_param_ranked_trackstub_candidate_min_impact_parameter_to_shower = np.nan
+        curr_impact_param_ranked_trackstub_candidate_min_conversion_dist_to_shower_start = np.nan
+        curr_impact_param_ranked_trackstub_candidate_min_ioc_to_shower_start = np.nan
+        curr_impact_param_ranked_trackstub_candidate_ioc_based_length = np.nan
+        curr_impact_param_ranked_trackstub_candidate_wire_tick_based_length = np.nan
+        curr_impact_param_ranked_trackstub_candidate_mean_ADC_first_half = np.nan
+        curr_impact_param_ranked_trackstub_candidate_mean_ADC_second_half = np.nan
+        curr_impact_param_ranked_trackstub_candidate_mean_ADC_first_to_second_ratio = np.nan
+        curr_impact_param_ranked_trackstub_candidate_track_angle_wrt_shower_direction = np.nan
+        curr_impact_param_ranked_trackstub_candidate_linear_fit_chi2 = np.nan
+        curr_impact_param_ranked_trackstub_candidate_energy = np.nan
+        # ensuring we have a non-empty list of unassoc hits that we can loop over
+        temp_list = trackstub_candidate_in_nu_slice[event_i]
+        if not (isinstance(temp_list, (float, np.floating)) or not hasattr(temp_list, '__len__') or len(temp_list) == 0): 
+            # looping over all unassoc hits
+            for unassoc_hit_j in range(len(temp_list)):
+                # saving values for the closest candidate
+                if trackstub_candidate_min_dist[event_i][unassoc_hit_j] < min_dist:
+                    min_dist = trackstub_candidate_min_dist[event_i][unassoc_hit_j]
+                    curr_dist_ranked_trackstub_candidate_in_nu_slice = trackstub_candidate_in_nu_slice[event_i][unassoc_hit_j]
+                    curr_dist_ranked_trackstub_candidate_num_hits = trackstub_candidate_num_hits[event_i][unassoc_hit_j]
+                    curr_dist_ranked_trackstub_candidate_num_wires = trackstub_candidate_num_wires[event_i][unassoc_hit_j]
+                    curr_dist_ranked_trackstub_candidate_num_ticks = trackstub_candidate_num_ticks[event_i][unassoc_hit_j]
+                    curr_dist_ranked_trackstub_candidate_plane = trackstub_candidate_plane[event_i][unassoc_hit_j]
+                    curr_dist_ranked_trackstub_candidate_PCA = trackstub_candidate_PCA[event_i][unassoc_hit_j]
+                    curr_dist_ranked_trackstub_candidate_mean_ADC = trackstub_candidate_mean_ADC[event_i][unassoc_hit_j]
+                    curr_dist_ranked_trackstub_candidate_ADC_RMS = trackstub_candidate_ADC_RMS[event_i][unassoc_hit_j]
+                    curr_dist_ranked_trackstub_candidate_min_dist = trackstub_candidate_min_dist[event_i][unassoc_hit_j]
+                    curr_dist_ranked_trackstub_candidate_min_impact_parameter_to_shower = trackstub_candidate_min_impact_parameter_to_shower[event_i][unassoc_hit_j]
+                    curr_dist_ranked_trackstub_candidate_min_conversion_dist_to_shower_start = trackstub_candidate_min_conversion_dist_to_shower_start[event_i][unassoc_hit_j]
+                    curr_dist_ranked_trackstub_candidate_min_ioc_to_shower_start = trackstub_candidate_min_ioc_to_shower_start[event_i][unassoc_hit_j]
+                    curr_dist_ranked_trackstub_candidate_ioc_based_length = trackstub_candidate_ioc_based_length[event_i][unassoc_hit_j]
+                    curr_dist_ranked_trackstub_candidate_wire_tick_based_length = trackstub_candidate_wire_tick_based_length[event_i][unassoc_hit_j]
+                    curr_dist_ranked_trackstub_candidate_mean_ADC_first_half = trackstub_candidate_mean_ADC_first_half[event_i][unassoc_hit_j]
+                    curr_dist_ranked_trackstub_candidate_mean_ADC_second_half = trackstub_candidate_mean_ADC_second_half[event_i][unassoc_hit_j]
+                    curr_dist_ranked_trackstub_candidate_mean_ADC_first_to_second_ratio = trackstub_candidate_mean_ADC_first_to_second_ratio[event_i][unassoc_hit_j]
+                    curr_dist_ranked_trackstub_candidate_track_angle_wrt_shower_direction = trackstub_candidate_track_angle_wrt_shower_direction[event_i][unassoc_hit_j]
+                    curr_dist_ranked_trackstub_candidate_linear_fit_chi2 = trackstub_candidate_linear_fit_chi2[event_i][unassoc_hit_j]
+                    curr_dist_ranked_trackstub_candidate_energy = trackstub_candidate_energy[event_i][unassoc_hit_j]
+                # saving values for the highest energy candidate
+                if trackstub_candidate_energy[event_i][unassoc_hit_j] > max_energy:
+                    max_energy = trackstub_candidate_energy[event_i][unassoc_hit_j]
+                    curr_energy_ranked_trackstub_candidate_in_nu_slice = trackstub_candidate_in_nu_slice[event_i][unassoc_hit_j]
+                    curr_energy_ranked_trackstub_candidate_num_hits = trackstub_candidate_num_hits[event_i][unassoc_hit_j]
+                    curr_energy_ranked_trackstub_candidate_num_wires = trackstub_candidate_num_wires[event_i][unassoc_hit_j]
+                    curr_energy_ranked_trackstub_candidate_num_ticks = trackstub_candidate_num_ticks[event_i][unassoc_hit_j]
+                    curr_energy_ranked_trackstub_candidate_plane = trackstub_candidate_plane[event_i][unassoc_hit_j]
+                    curr_energy_ranked_trackstub_candidate_PCA = trackstub_candidate_PCA[event_i][unassoc_hit_j]
+                    curr_energy_ranked_trackstub_candidate_mean_ADC = trackstub_candidate_mean_ADC[event_i][unassoc_hit_j]
+                    curr_energy_ranked_trackstub_candidate_ADC_RMS = trackstub_candidate_ADC_RMS[event_i][unassoc_hit_j]
+                    curr_energy_ranked_trackstub_candidate_min_dist = trackstub_candidate_min_dist[event_i][unassoc_hit_j]
+                    curr_energy_ranked_trackstub_candidate_min_impact_parameter_to_shower = trackstub_candidate_min_impact_parameter_to_shower[event_i][unassoc_hit_j]
+                    curr_energy_ranked_trackstub_candidate_min_conversion_dist_to_shower_start = trackstub_candidate_min_conversion_dist_to_shower_start[event_i][unassoc_hit_j]
+                    curr_energy_ranked_trackstub_candidate_min_ioc_to_shower_start = trackstub_candidate_min_ioc_to_shower_start[event_i][unassoc_hit_j]
+                    curr_energy_ranked_trackstub_candidate_ioc_based_length = trackstub_candidate_ioc_based_length[event_i][unassoc_hit_j]
+                    curr_energy_ranked_trackstub_candidate_wire_tick_based_length = trackstub_candidate_wire_tick_based_length[event_i][unassoc_hit_j]
+                    curr_energy_ranked_trackstub_candidate_mean_ADC_first_half = trackstub_candidate_mean_ADC_first_half[event_i][unassoc_hit_j]
+                    curr_energy_ranked_trackstub_candidate_mean_ADC_second_half = trackstub_candidate_mean_ADC_second_half[event_i][unassoc_hit_j]
+                    curr_energy_ranked_trackstub_candidate_mean_ADC_first_to_second_ratio = trackstub_candidate_mean_ADC_first_to_second_ratio[event_i][unassoc_hit_j]
+                    curr_energy_ranked_trackstub_candidate_track_angle_wrt_shower_direction = trackstub_candidate_track_angle_wrt_shower_direction[event_i][unassoc_hit_j]
+                    curr_energy_ranked_trackstub_candidate_linear_fit_chi2 = trackstub_candidate_linear_fit_chi2[event_i][unassoc_hit_j]
+                    curr_energy_ranked_trackstub_candidate_energy = trackstub_candidate_energy[event_i][unassoc_hit_j]
+                # saving values for the min conversion distance candidate
+                if trackstub_candidate_min_conversion_dist_to_shower_start[event_i][unassoc_hit_j] < min_conv:
+                    min_conv = trackstub_candidate_min_conversion_dist_to_shower_start[event_i][unassoc_hit_j]
+                    curr_conv_ranked_trackstub_candidate_in_nu_slice = trackstub_candidate_in_nu_slice[event_i][unassoc_hit_j]
+                    curr_conv_ranked_trackstub_candidate_num_hits = trackstub_candidate_num_hits[event_i][unassoc_hit_j]
+                    curr_conv_ranked_trackstub_candidate_num_wires = trackstub_candidate_num_wires[event_i][unassoc_hit_j]
+                    curr_conv_ranked_trackstub_candidate_num_ticks = trackstub_candidate_num_ticks[event_i][unassoc_hit_j]
+                    curr_conv_ranked_trackstub_candidate_plane = trackstub_candidate_plane[event_i][unassoc_hit_j]
+                    curr_conv_ranked_trackstub_candidate_PCA = trackstub_candidate_PCA[event_i][unassoc_hit_j]
+                    curr_conv_ranked_trackstub_candidate_mean_ADC = trackstub_candidate_mean_ADC[event_i][unassoc_hit_j]
+                    curr_conv_ranked_trackstub_candidate_ADC_RMS = trackstub_candidate_ADC_RMS[event_i][unassoc_hit_j]
+                    curr_conv_ranked_trackstub_candidate_min_dist = trackstub_candidate_min_dist[event_i][unassoc_hit_j]
+                    curr_conv_ranked_trackstub_candidate_min_impact_parameter_to_shower = trackstub_candidate_min_impact_parameter_to_shower[event_i][unassoc_hit_j]
+                    curr_conv_ranked_trackstub_candidate_min_conversion_dist_to_shower_start = trackstub_candidate_min_conversion_dist_to_shower_start[event_i][unassoc_hit_j]
+                    curr_conv_ranked_trackstub_candidate_min_ioc_to_shower_start = trackstub_candidate_min_ioc_to_shower_start[event_i][unassoc_hit_j]
+                    curr_conv_ranked_trackstub_candidate_ioc_based_length = trackstub_candidate_ioc_based_length[event_i][unassoc_hit_j]
+                    curr_conv_ranked_trackstub_candidate_wire_tick_based_length = trackstub_candidate_wire_tick_based_length[event_i][unassoc_hit_j]
+                    curr_conv_ranked_trackstub_candidate_mean_ADC_first_half = trackstub_candidate_mean_ADC_first_half[event_i][unassoc_hit_j]
+                    curr_conv_ranked_trackstub_candidate_mean_ADC_second_half = trackstub_candidate_mean_ADC_second_half[event_i][unassoc_hit_j]
+                    curr_conv_ranked_trackstub_candidate_mean_ADC_first_to_second_ratio = trackstub_candidate_mean_ADC_first_to_second_ratio[event_i][unassoc_hit_j]
+                    curr_conv_ranked_trackstub_candidate_track_angle_wrt_shower_direction = trackstub_candidate_track_angle_wrt_shower_direction[event_i][unassoc_hit_j]
+                    curr_conv_ranked_trackstub_candidate_linear_fit_chi2 = trackstub_candidate_linear_fit_chi2[event_i][unassoc_hit_j]
+                    curr_conv_ranked_trackstub_candidate_energy = trackstub_candidate_energy[event_i][unassoc_hit_j]
+                # saving values for the min impact parameter candidate
+                if trackstub_candidate_min_impact_parameter_to_shower[event_i][unassoc_hit_j] < min_impact_param:
+                    min_impact_param = trackstub_candidate_min_impact_parameter_to_shower[event_i][unassoc_hit_j]
+                    curr_impact_param_ranked_trackstub_candidate_in_nu_slice = trackstub_candidate_in_nu_slice[event_i][unassoc_hit_j]
+                    curr_impact_param_ranked_trackstub_candidate_num_hits = trackstub_candidate_num_hits[event_i][unassoc_hit_j]
+                    curr_impact_param_ranked_trackstub_candidate_num_wires = trackstub_candidate_num_wires[event_i][unassoc_hit_j]
+                    curr_impact_param_ranked_trackstub_candidate_num_ticks = trackstub_candidate_num_ticks[event_i][unassoc_hit_j]
+                    curr_impact_param_ranked_trackstub_candidate_plane = trackstub_candidate_plane[event_i][unassoc_hit_j]
+                    curr_impact_param_ranked_trackstub_candidate_PCA = trackstub_candidate_PCA[event_i][unassoc_hit_j]
+                    curr_impact_param_ranked_trackstub_candidate_mean_ADC = trackstub_candidate_mean_ADC[event_i][unassoc_hit_j]
+                    curr_impact_param_ranked_trackstub_candidate_ADC_RMS = trackstub_candidate_ADC_RMS[event_i][unassoc_hit_j]
+                    curr_impact_param_ranked_trackstub_candidate_min_dist = trackstub_candidate_min_dist[event_i][unassoc_hit_j]
+                    curr_impact_param_ranked_trackstub_candidate_min_impact_parameter_to_shower = trackstub_candidate_min_impact_parameter_to_shower[event_i][unassoc_hit_j]
+                    curr_impact_param_ranked_trackstub_candidate_min_conversion_dist_to_shower_start = trackstub_candidate_min_conversion_dist_to_shower_start[event_i][unassoc_hit_j]
+                    curr_impact_param_ranked_trackstub_candidate_min_ioc_to_shower_start = trackstub_candidate_min_ioc_to_shower_start[event_i][unassoc_hit_j]
+                    curr_impact_param_ranked_trackstub_candidate_ioc_based_length = trackstub_candidate_ioc_based_length[event_i][unassoc_hit_j]
+                    curr_impact_param_ranked_trackstub_candidate_wire_tick_based_length = trackstub_candidate_wire_tick_based_length[event_i][unassoc_hit_j]
+                    curr_impact_param_ranked_trackstub_candidate_mean_ADC_first_half = trackstub_candidate_mean_ADC_first_half[event_i][unassoc_hit_j]
+                    curr_impact_param_ranked_trackstub_candidate_mean_ADC_second_half = trackstub_candidate_mean_ADC_second_half[event_i][unassoc_hit_j]
+                    curr_impact_param_ranked_trackstub_candidate_mean_ADC_first_to_second_ratio = trackstub_candidate_mean_ADC_first_to_second_ratio[event_i][unassoc_hit_j]
+                    curr_impact_param_ranked_trackstub_candidate_track_angle_wrt_shower_direction = trackstub_candidate_track_angle_wrt_shower_direction[event_i][unassoc_hit_j]
+                    curr_impact_param_ranked_trackstub_candidate_linear_fit_chi2 = trackstub_candidate_linear_fit_chi2[event_i][unassoc_hit_j]
+                    curr_impact_param_ranked_trackstub_candidate_energy = trackstub_candidate_energy[event_i][unassoc_hit_j]
+
+        dist_ranked_trackstub_candidate_in_nu_slice.append(curr_dist_ranked_trackstub_candidate_in_nu_slice)
+        dist_ranked_trackstub_candidate_num_hits.append(curr_dist_ranked_trackstub_candidate_num_hits)
+        dist_ranked_trackstub_candidate_num_wires.append(curr_dist_ranked_trackstub_candidate_num_wires)
+        dist_ranked_trackstub_candidate_num_ticks.append(curr_dist_ranked_trackstub_candidate_num_ticks)
+        dist_ranked_trackstub_candidate_plane.append(curr_dist_ranked_trackstub_candidate_plane)
+        dist_ranked_trackstub_candidate_PCA.append(curr_dist_ranked_trackstub_candidate_PCA)
+        dist_ranked_trackstub_candidate_mean_ADC.append(curr_dist_ranked_trackstub_candidate_mean_ADC)
+        dist_ranked_trackstub_candidate_ADC_RMS.append(curr_dist_ranked_trackstub_candidate_ADC_RMS)
+        dist_ranked_trackstub_candidate_min_dist.append(curr_dist_ranked_trackstub_candidate_min_dist)
+        dist_ranked_trackstub_candidate_min_impact_parameter_to_shower.append(curr_dist_ranked_trackstub_candidate_min_impact_parameter_to_shower)
+        dist_ranked_trackstub_candidate_min_conversion_dist_to_shower_start.append(curr_dist_ranked_trackstub_candidate_min_conversion_dist_to_shower_start)
+        dist_ranked_trackstub_candidate_min_ioc_to_shower_start.append(curr_dist_ranked_trackstub_candidate_min_ioc_to_shower_start)
+        dist_ranked_trackstub_candidate_ioc_based_length.append(curr_dist_ranked_trackstub_candidate_ioc_based_length)
+        dist_ranked_trackstub_candidate_wire_tick_based_length.append(curr_dist_ranked_trackstub_candidate_wire_tick_based_length)
+        dist_ranked_trackstub_candidate_mean_ADC_first_half.append(curr_dist_ranked_trackstub_candidate_mean_ADC_first_half)
+        dist_ranked_trackstub_candidate_mean_ADC_second_half.append(curr_dist_ranked_trackstub_candidate_mean_ADC_second_half)
+        dist_ranked_trackstub_candidate_mean_ADC_first_to_second_ratio.append(curr_dist_ranked_trackstub_candidate_mean_ADC_first_to_second_ratio)
+        dist_ranked_trackstub_candidate_track_angle_wrt_shower_direction.append(curr_dist_ranked_trackstub_candidate_track_angle_wrt_shower_direction)
+        dist_ranked_trackstub_candidate_linear_fit_chi2.append(curr_dist_ranked_trackstub_candidate_linear_fit_chi2)
+        dist_ranked_trackstub_candidate_energy.append(curr_dist_ranked_trackstub_candidate_energy)
+        energy_ranked_trackstub_candidate_in_nu_slice.append(curr_energy_ranked_trackstub_candidate_in_nu_slice)
+        energy_ranked_trackstub_candidate_num_hits.append(curr_energy_ranked_trackstub_candidate_num_hits)
+        energy_ranked_trackstub_candidate_num_wires.append(curr_energy_ranked_trackstub_candidate_num_wires)
+        energy_ranked_trackstub_candidate_num_ticks.append(curr_energy_ranked_trackstub_candidate_num_ticks)
+        energy_ranked_trackstub_candidate_plane.append(curr_energy_ranked_trackstub_candidate_plane)
+        energy_ranked_trackstub_candidate_PCA.append(curr_energy_ranked_trackstub_candidate_PCA)
+        energy_ranked_trackstub_candidate_mean_ADC.append(curr_energy_ranked_trackstub_candidate_mean_ADC)
+        energy_ranked_trackstub_candidate_ADC_RMS.append(curr_energy_ranked_trackstub_candidate_ADC_RMS)
+        energy_ranked_trackstub_candidate_min_dist.append(curr_energy_ranked_trackstub_candidate_min_dist)
+        energy_ranked_trackstub_candidate_min_impact_parameter_to_shower.append(curr_energy_ranked_trackstub_candidate_min_impact_parameter_to_shower)
+        energy_ranked_trackstub_candidate_min_conversion_dist_to_shower_start.append(curr_energy_ranked_trackstub_candidate_min_conversion_dist_to_shower_start)
+        energy_ranked_trackstub_candidate_min_ioc_to_shower_start.append(curr_energy_ranked_trackstub_candidate_min_ioc_to_shower_start)
+        energy_ranked_trackstub_candidate_ioc_based_length.append(curr_energy_ranked_trackstub_candidate_ioc_based_length)
+        energy_ranked_trackstub_candidate_wire_tick_based_length.append(curr_energy_ranked_trackstub_candidate_wire_tick_based_length)
+        energy_ranked_trackstub_candidate_mean_ADC_first_half.append(curr_energy_ranked_trackstub_candidate_mean_ADC_first_half)
+        energy_ranked_trackstub_candidate_mean_ADC_second_half.append(curr_energy_ranked_trackstub_candidate_mean_ADC_second_half)
+        energy_ranked_trackstub_candidate_mean_ADC_first_to_second_ratio.append(curr_energy_ranked_trackstub_candidate_mean_ADC_first_to_second_ratio)
+        energy_ranked_trackstub_candidate_track_angle_wrt_shower_direction.append(curr_energy_ranked_trackstub_candidate_track_angle_wrt_shower_direction)
+        energy_ranked_trackstub_candidate_linear_fit_chi2.append(curr_energy_ranked_trackstub_candidate_linear_fit_chi2)
+        energy_ranked_trackstub_candidate_energy.append(curr_energy_ranked_trackstub_candidate_energy)
+        conv_ranked_trackstub_candidate_in_nu_slice.append(curr_conv_ranked_trackstub_candidate_in_nu_slice)
+        conv_ranked_trackstub_candidate_num_hits.append(curr_conv_ranked_trackstub_candidate_num_hits)
+        conv_ranked_trackstub_candidate_num_wires.append(curr_conv_ranked_trackstub_candidate_num_wires)
+        conv_ranked_trackstub_candidate_num_ticks.append(curr_conv_ranked_trackstub_candidate_num_ticks)
+        conv_ranked_trackstub_candidate_plane.append(curr_conv_ranked_trackstub_candidate_plane)
+        conv_ranked_trackstub_candidate_PCA.append(curr_conv_ranked_trackstub_candidate_PCA)
+        conv_ranked_trackstub_candidate_mean_ADC.append(curr_conv_ranked_trackstub_candidate_mean_ADC)
+        conv_ranked_trackstub_candidate_ADC_RMS.append(curr_conv_ranked_trackstub_candidate_ADC_RMS)
+        conv_ranked_trackstub_candidate_min_dist.append(curr_conv_ranked_trackstub_candidate_min_dist)
+        conv_ranked_trackstub_candidate_min_impact_parameter_to_shower.append(curr_conv_ranked_trackstub_candidate_min_impact_parameter_to_shower)
+        conv_ranked_trackstub_candidate_min_conversion_dist_to_shower_start.append(curr_conv_ranked_trackstub_candidate_min_conversion_dist_to_shower_start)
+        conv_ranked_trackstub_candidate_min_ioc_to_shower_start.append(curr_conv_ranked_trackstub_candidate_min_ioc_to_shower_start)
+        conv_ranked_trackstub_candidate_ioc_based_length.append(curr_conv_ranked_trackstub_candidate_ioc_based_length)
+        conv_ranked_trackstub_candidate_wire_tick_based_length.append(curr_conv_ranked_trackstub_candidate_wire_tick_based_length)
+        conv_ranked_trackstub_candidate_mean_ADC_first_half.append(curr_conv_ranked_trackstub_candidate_mean_ADC_first_half)
+        conv_ranked_trackstub_candidate_mean_ADC_second_half.append(curr_conv_ranked_trackstub_candidate_mean_ADC_second_half)
+        conv_ranked_trackstub_candidate_mean_ADC_first_to_second_ratio.append(curr_conv_ranked_trackstub_candidate_mean_ADC_first_to_second_ratio)
+        conv_ranked_trackstub_candidate_track_angle_wrt_shower_direction.append(curr_conv_ranked_trackstub_candidate_track_angle_wrt_shower_direction)
+        conv_ranked_trackstub_candidate_linear_fit_chi2.append(curr_conv_ranked_trackstub_candidate_linear_fit_chi2)
+        conv_ranked_trackstub_candidate_energy.append(curr_conv_ranked_trackstub_candidate_energy)
+        impact_param_ranked_trackstub_candidate_in_nu_slice.append(curr_impact_param_ranked_trackstub_candidate_in_nu_slice)
+        impact_param_ranked_trackstub_candidate_num_hits.append(curr_impact_param_ranked_trackstub_candidate_num_hits)
+        impact_param_ranked_trackstub_candidate_num_wires.append(curr_impact_param_ranked_trackstub_candidate_num_wires)
+        impact_param_ranked_trackstub_candidate_num_ticks.append(curr_impact_param_ranked_trackstub_candidate_num_ticks)
+        impact_param_ranked_trackstub_candidate_plane.append(curr_impact_param_ranked_trackstub_candidate_plane)
+        impact_param_ranked_trackstub_candidate_PCA.append(curr_impact_param_ranked_trackstub_candidate_PCA)
+        impact_param_ranked_trackstub_candidate_mean_ADC.append(curr_impact_param_ranked_trackstub_candidate_mean_ADC)
+        impact_param_ranked_trackstub_candidate_ADC_RMS.append(curr_impact_param_ranked_trackstub_candidate_ADC_RMS)
+        impact_param_ranked_trackstub_candidate_min_dist.append(curr_impact_param_ranked_trackstub_candidate_min_dist)
+        impact_param_ranked_trackstub_candidate_min_impact_parameter_to_shower.append(curr_impact_param_ranked_trackstub_candidate_min_impact_parameter_to_shower)
+        impact_param_ranked_trackstub_candidate_min_conversion_dist_to_shower_start.append(curr_impact_param_ranked_trackstub_candidate_min_conversion_dist_to_shower_start)
+        impact_param_ranked_trackstub_candidate_min_ioc_to_shower_start.append(curr_impact_param_ranked_trackstub_candidate_min_ioc_to_shower_start)
+        impact_param_ranked_trackstub_candidate_ioc_based_length.append(curr_impact_param_ranked_trackstub_candidate_ioc_based_length)
+        impact_param_ranked_trackstub_candidate_wire_tick_based_length.append(curr_impact_param_ranked_trackstub_candidate_wire_tick_based_length)
+        impact_param_ranked_trackstub_candidate_mean_ADC_first_half.append(curr_impact_param_ranked_trackstub_candidate_mean_ADC_first_half)
+        impact_param_ranked_trackstub_candidate_mean_ADC_second_half.append(curr_impact_param_ranked_trackstub_candidate_mean_ADC_second_half)
+        impact_param_ranked_trackstub_candidate_mean_ADC_first_to_second_ratio.append(curr_impact_param_ranked_trackstub_candidate_mean_ADC_first_to_second_ratio)
+        impact_param_ranked_trackstub_candidate_track_angle_wrt_shower_direction.append(curr_impact_param_ranked_trackstub_candidate_track_angle_wrt_shower_direction)
+        impact_param_ranked_trackstub_candidate_linear_fit_chi2.append(curr_impact_param_ranked_trackstub_candidate_linear_fit_chi2)
+        impact_param_ranked_trackstub_candidate_energy.append(curr_impact_param_ranked_trackstub_candidate_energy)
+
+    glee_trackstub_candidate_df = pd.DataFrame({
+        "glee_dist_ranked_trackstub_candidate_in_nu_slice": dist_ranked_trackstub_candidate_in_nu_slice,
+        "glee_dist_ranked_trackstub_candidate_num_hits": dist_ranked_trackstub_candidate_num_hits,
+        "glee_dist_ranked_trackstub_candidate_num_wires": dist_ranked_trackstub_candidate_num_wires,
+        "glee_dist_ranked_trackstub_candidate_num_ticks": dist_ranked_trackstub_candidate_num_ticks,
+        "glee_dist_ranked_trackstub_candidate_plane": dist_ranked_trackstub_candidate_plane,
+        "glee_dist_ranked_trackstub_candidate_PCA": dist_ranked_trackstub_candidate_PCA,
+        "glee_dist_ranked_trackstub_candidate_mean_ADC": dist_ranked_trackstub_candidate_mean_ADC,
+        "glee_dist_ranked_trackstub_candidate_ADC_RMS": dist_ranked_trackstub_candidate_ADC_RMS,
+        "glee_dist_ranked_trackstub_candidate_min_dist": dist_ranked_trackstub_candidate_min_dist,
+        "glee_dist_ranked_trackstub_candidate_min_impact_parameter_to_shower": dist_ranked_trackstub_candidate_min_impact_parameter_to_shower,
+        "glee_dist_ranked_trackstub_candidate_min_conversion_dist_to_shower_start": dist_ranked_trackstub_candidate_min_conversion_dist_to_shower_start,
+        "glee_dist_ranked_trackstub_candidate_min_ioc_to_shower_start": dist_ranked_trackstub_candidate_min_ioc_to_shower_start,
+        "glee_dist_ranked_trackstub_candidate_ioc_based_length": dist_ranked_trackstub_candidate_ioc_based_length,
+        "glee_dist_ranked_trackstub_candidate_wire_tick_based_length": dist_ranked_trackstub_candidate_wire_tick_based_length,
+        "glee_dist_ranked_trackstub_candidate_mean_ADC_first_half": dist_ranked_trackstub_candidate_mean_ADC_first_half,
+        "glee_dist_ranked_trackstub_candidate_mean_ADC_second_half": dist_ranked_trackstub_candidate_mean_ADC_second_half,
+        "glee_dist_ranked_trackstub_candidate_mean_ADC_first_to_second_ratio": dist_ranked_trackstub_candidate_mean_ADC_first_to_second_ratio,
+        "glee_dist_ranked_trackstub_candidate_track_angle_wrt_shower_direction": dist_ranked_trackstub_candidate_track_angle_wrt_shower_direction,
+        "glee_dist_ranked_trackstub_candidate_linear_fit_chi2": dist_ranked_trackstub_candidate_linear_fit_chi2,
+        "glee_dist_ranked_trackstub_candidate_energy": dist_ranked_trackstub_candidate_energy,
+        "glee_energy_ranked_trackstub_candidate_in_nu_slice": energy_ranked_trackstub_candidate_in_nu_slice,
+        "glee_energy_ranked_trackstub_candidate_num_hits": energy_ranked_trackstub_candidate_num_hits,
+        "glee_energy_ranked_trackstub_candidate_num_wires": energy_ranked_trackstub_candidate_num_wires,
+        "glee_energy_ranked_trackstub_candidate_num_ticks": energy_ranked_trackstub_candidate_num_ticks,
+        "glee_energy_ranked_trackstub_candidate_plane": energy_ranked_trackstub_candidate_plane,
+        "glee_energy_ranked_trackstub_candidate_PCA": energy_ranked_trackstub_candidate_PCA,
+        "glee_energy_ranked_trackstub_candidate_mean_ADC": energy_ranked_trackstub_candidate_mean_ADC,
+        "glee_energy_ranked_trackstub_candidate_ADC_RMS": energy_ranked_trackstub_candidate_ADC_RMS,
+        "glee_energy_ranked_trackstub_candidate_min_dist": energy_ranked_trackstub_candidate_min_dist,
+        "glee_energy_ranked_trackstub_candidate_min_impact_parameter_to_shower": energy_ranked_trackstub_candidate_min_impact_parameter_to_shower,
+        "glee_energy_ranked_trackstub_candidate_min_conversion_dist_to_shower_start": energy_ranked_trackstub_candidate_min_conversion_dist_to_shower_start,
+        "glee_energy_ranked_trackstub_candidate_min_ioc_to_shower_start": energy_ranked_trackstub_candidate_min_ioc_to_shower_start,
+        "glee_energy_ranked_trackstub_candidate_ioc_based_length": energy_ranked_trackstub_candidate_ioc_based_length,
+        "glee_energy_ranked_trackstub_candidate_wire_tick_based_length": energy_ranked_trackstub_candidate_wire_tick_based_length,
+        "glee_energy_ranked_trackstub_candidate_mean_ADC_first_half": energy_ranked_trackstub_candidate_mean_ADC_first_half,
+        "glee_energy_ranked_trackstub_candidate_mean_ADC_second_half": energy_ranked_trackstub_candidate_mean_ADC_second_half,
+        "glee_energy_ranked_trackstub_candidate_mean_ADC_first_to_second_ratio": energy_ranked_trackstub_candidate_mean_ADC_first_to_second_ratio,
+        "glee_energy_ranked_trackstub_candidate_track_angle_wrt_shower_direction": energy_ranked_trackstub_candidate_track_angle_wrt_shower_direction,
+        "glee_energy_ranked_trackstub_candidate_linear_fit_chi2": energy_ranked_trackstub_candidate_linear_fit_chi2,
+        "glee_energy_ranked_trackstub_candidate_energy": energy_ranked_trackstub_candidate_energy,
+        "glee_conv_ranked_trackstub_candidate_in_nu_slice": conv_ranked_trackstub_candidate_in_nu_slice,
+        "glee_conv_ranked_trackstub_candidate_num_hits": conv_ranked_trackstub_candidate_num_hits,
+        "glee_conv_ranked_trackstub_candidate_num_wires": conv_ranked_trackstub_candidate_num_wires,
+        "glee_conv_ranked_trackstub_candidate_num_ticks": conv_ranked_trackstub_candidate_num_ticks,
+        "glee_conv_ranked_trackstub_candidate_plane": conv_ranked_trackstub_candidate_plane,
+        "glee_conv_ranked_trackstub_candidate_PCA": conv_ranked_trackstub_candidate_PCA,
+        "glee_conv_ranked_trackstub_candidate_mean_ADC": conv_ranked_trackstub_candidate_mean_ADC,
+        "glee_conv_ranked_trackstub_candidate_ADC_RMS": conv_ranked_trackstub_candidate_ADC_RMS,
+        "glee_conv_ranked_trackstub_candidate_min_dist": conv_ranked_trackstub_candidate_min_dist,
+        "glee_conv_ranked_trackstub_candidate_min_impact_parameter_to_shower": conv_ranked_trackstub_candidate_min_impact_parameter_to_shower,
+        "glee_conv_ranked_trackstub_candidate_min_conversion_dist_to_shower_start": conv_ranked_trackstub_candidate_min_conversion_dist_to_shower_start,
+        "glee_conv_ranked_trackstub_candidate_min_ioc_to_shower_start": conv_ranked_trackstub_candidate_min_ioc_to_shower_start,
+        "glee_conv_ranked_trackstub_candidate_ioc_based_length": conv_ranked_trackstub_candidate_ioc_based_length,
+        "glee_conv_ranked_trackstub_candidate_wire_tick_based_length": conv_ranked_trackstub_candidate_wire_tick_based_length,
+        "glee_conv_ranked_trackstub_candidate_mean_ADC_first_half": conv_ranked_trackstub_candidate_mean_ADC_first_half,
+        "glee_conv_ranked_trackstub_candidate_mean_ADC_second_half": conv_ranked_trackstub_candidate_mean_ADC_second_half,
+        "glee_conv_ranked_trackstub_candidate_mean_ADC_first_to_second_ratio": conv_ranked_trackstub_candidate_mean_ADC_first_to_second_ratio,
+        "glee_conv_ranked_trackstub_candidate_track_angle_wrt_shower_direction": conv_ranked_trackstub_candidate_track_angle_wrt_shower_direction,
+        "glee_conv_ranked_trackstub_candidate_linear_fit_chi2": conv_ranked_trackstub_candidate_linear_fit_chi2,
+        "glee_conv_ranked_trackstub_candidate_energy": conv_ranked_trackstub_candidate_energy,
+        "glee_impact_param_ranked_trackstub_candidate_in_nu_slice": impact_param_ranked_trackstub_candidate_in_nu_slice,
+        "glee_impact_param_ranked_trackstub_candidate_num_hits": impact_param_ranked_trackstub_candidate_num_hits,
+        "glee_impact_param_ranked_trackstub_candidate_num_wires": impact_param_ranked_trackstub_candidate_num_wires,
+        "glee_impact_param_ranked_trackstub_candidate_num_ticks": impact_param_ranked_trackstub_candidate_num_ticks,
+        "glee_impact_param_ranked_trackstub_candidate_plane": impact_param_ranked_trackstub_candidate_plane,
+        "glee_impact_param_ranked_trackstub_candidate_PCA": impact_param_ranked_trackstub_candidate_PCA,
+        "glee_impact_param_ranked_trackstub_candidate_mean_ADC": impact_param_ranked_trackstub_candidate_mean_ADC,
+        "glee_impact_param_ranked_trackstub_candidate_ADC_RMS": impact_param_ranked_trackstub_candidate_ADC_RMS,
+        "glee_impact_param_ranked_trackstub_candidate_min_dist": impact_param_ranked_trackstub_candidate_min_dist,
+        "glee_impact_param_ranked_trackstub_candidate_min_impact_parameter_to_shower": impact_param_ranked_trackstub_candidate_min_impact_parameter_to_shower,
+        "glee_impact_param_ranked_trackstub_candidate_min_conversion_dist_to_shower_start": impact_param_ranked_trackstub_candidate_min_conversion_dist_to_shower_start,
+        "glee_impact_param_ranked_trackstub_candidate_min_ioc_to_shower_start": impact_param_ranked_trackstub_candidate_min_ioc_to_shower_start,
+        "glee_impact_param_ranked_trackstub_candidate_ioc_based_length": impact_param_ranked_trackstub_candidate_ioc_based_length,
+        "glee_impact_param_ranked_trackstub_candidate_wire_tick_based_length": impact_param_ranked_trackstub_candidate_wire_tick_based_length,
+        "glee_impact_param_ranked_trackstub_candidate_mean_ADC_first_half": impact_param_ranked_trackstub_candidate_mean_ADC_first_half,
+        "glee_impact_param_ranked_trackstub_candidate_mean_ADC_second_half": impact_param_ranked_trackstub_candidate_mean_ADC_second_half,
+        "glee_impact_param_ranked_trackstub_candidate_mean_ADC_first_to_second_ratio": impact_param_ranked_trackstub_candidate_mean_ADC_first_to_second_ratio,
+        "glee_impact_param_ranked_trackstub_candidate_track_angle_wrt_shower_direction": impact_param_ranked_trackstub_candidate_track_angle_wrt_shower_direction,
+        "glee_impact_param_ranked_trackstub_candidate_linear_fit_chi2": impact_param_ranked_trackstub_candidate_linear_fit_chi2,
+        "glee_impact_param_ranked_trackstub_candidate_energy": impact_param_ranked_trackstub_candidate_energy,
+    }, index=df.index)
+
+    df = pd.concat([df, glee_isolation_df, glee_trackstub_candidate_df], axis=1)
 
     return df
 
@@ -2500,3 +3372,150 @@ def remove_vector_variables(df):
 
     save_columns = [col for col in df.columns if col not in vector_columns]
     return df[save_columns]
+
+
+def add_1g1mu_rad_corr_events(df):
+    """Append numuCC_rad_corrected events derived from delete_one_gamma_overlay.
+
+    Accepts either an eager DataFrame or a LazyFrame.
+
+    - Eager DataFrame: returns the full df with rad-corrected rows appended.
+    - LazyFrame: uses predicate pushdown to collect *only* the new rad-corrected
+      rows (small, cheap) and returns them as an eager DataFrame.  The caller is
+      responsible for concatenating these rows with the full df after calling
+      pl.read_parquet separately.
+    """
+    print("adding 1g1mu rad correction events to the dataframe")
+
+    is_lazy = isinstance(df, pl.LazyFrame)
+
+    # Weights are pre-computed in rad_corrections_reweighting.ipynb and saved to parquet.
+    # Columns: run, subrun, event, fix_del1g_weight, x_eta_uniform_weight, rad_frac_x_eta,
+    #          wc_muon_gamma_opening_angle
+    # Only events with all weights > 0 are present in the parquet.
+    # Use scan_parquet so the weights are read lazily as part of the same query plan.
+    rad_weights_lf = pl.scan_parquet(
+        f"{intermediate_files_location}/del1g_rad_correction_weights.parquet"
+    )
+    print("  rad_weights parquet queued for lazy scan")
+
+    lf = df if is_lazy else df.lazy()
+
+    # Drop any stale weight columns that may already exist on the main df (e.g.
+    # from a previous run whose temp parquet was not cleaned up) to avoid column
+    # naming collisions when the join suffix is applied.
+    # Note: wc_muon_gamma_opening_angle comes from the weights parquet and should
+    # NOT be in the main df before this step (we no longer add it as a null column
+    # to the full df since that caused a ~44 GB memory spike).
+    stale = [c for c in ["fix_del1g_weight", "x_eta_uniform_weight",
+                          "rad_frac_x_eta", "wc_muon_gamma_opening_angle"]
+             if c in lf.collect_schema().names()]
+    if stale:
+        print(f"  WARNING: dropping stale weight columns before join: {stale}")
+        lf = lf.drop(stale)
+
+    rad_corrected_lf = (
+        lf.filter(
+            (pl.col("filetype") == "delete_one_gamma_overlay") &
+            (pl.col("wc_truth_muonMomentum_3") > 0.0)
+        )
+        # inner join: events not in the weights parquet (invalid weights) are dropped.
+        # No suffix needed: wc_muon_gamma_opening_angle only exists in the weights parquet
+        # (we dropped it from the main df above if it was stale).
+        .join(rad_weights_lf, on=["run", "subrun", "event"], how="inner")
+        .with_columns([
+            (pl.col("wc_net_weight")
+             * pl.col("fix_del1g_weight")
+             * pl.col("x_eta_uniform_weight")
+             * pl.col("rad_frac_x_eta")
+            ).cast(pl.Float32).alias("wc_net_weight"),
+            pl.lit("numuCC_rad_corrected").alias("filetype"),
+            pl.col("wc_muon_gamma_opening_angle").cast(pl.Float32),
+            pl.lit(False).alias("normal_overlay"),
+            pl.lit(False).alias("del1g_overlay"),
+            pl.lit(False).alias("iso1g_overlay"),
+        ])
+        .drop(["fix_del1g_weight", "x_eta_uniform_weight", "rad_frac_x_eta"])
+    )
+
+    if is_lazy:
+        # Collect only the small filtered sub-df (predicate pushdown reads only
+        # delete_one_gamma_overlay rows from the parquet scan).  Caller concats
+        # these new rows with the full df after reading it separately.
+        print("  collecting rad_corrected rows (lazy mode)...")
+        rad_corrected_df = rad_corrected_lf.collect()
+        print(f"  collected {rad_corrected_df.height} rad-corrected rows")
+        return rad_corrected_df
+
+    # Eager path: concat immediately and return full df.
+    print("  starting concat...")
+    rad_corrected_df = rad_corrected_lf.collect()
+    df = pl.concat([df, rad_corrected_df], how="diagonal_relaxed")
+    del rad_corrected_df
+    gc.collect()
+    return df
+
+def add_nc_coh_1g_reweighted_events(df):
+    """Append NC_coherent_1g_reweighted events derived from isotropic_one_gamma_overlay.
+
+    Accepts either an eager DataFrame or a LazyFrame.
+
+    - Eager DataFrame: returns the full df with coherent rows appended.
+    - LazyFrame: uses predicate pushdown to collect *only* the new coherent rows
+      (small, cheap) and returns them as an eager DataFrame.  The caller is
+      responsible for concatenating these rows with the full df after calling
+      pl.read_parquet separately.
+    """
+    print("adding NC Coherent 1g reweighted events to the dataframe")
+
+    is_lazy = isinstance(df, pl.LazyFrame)
+
+    # Weights are pre-computed in coherent_1g_reweighting.ipynb and saved to parquet.
+    # Columns: run, subrun, event, coherent_1g_weight, coherent_1g_keep
+    # Only events with coherent_1g_weight > 0 are present in the parquet.
+    # Use scan_parquet so the weights are read lazily as part of the same query plan.
+    coherent_weights_lf = pl.scan_parquet(
+        f"{intermediate_files_location}/coherent_1g_reweighting_weights.parquet"
+    )
+    print("  coherent_weights parquet queued for lazy scan")
+
+    lf = df if is_lazy else df.lazy()
+
+    coherent_1g_lf = (
+        lf.filter(pl.col("filetype") == "isotropic_one_gamma_overlay")
+        # inner join: events in empty coherent bins are dropped
+        .join(coherent_weights_lf, on=["run", "subrun", "event"], how="inner")
+        .with_columns([
+            (pl.col("coherent_1g_weight"))
+              .cast(pl.Float32).alias("wc_net_weight"),
+            pl.lit("NC_coherent_1g_reweighted").alias("filetype"),
+            pl.lit(False).alias("normal_overlay"),
+            pl.lit(False).alias("del1g_overlay"),
+            pl.lit(False).alias("iso1g_overlay"),
+        ])
+        .drop("coherent_1g_weight")
+    )
+
+    if is_lazy:
+        # Collect only the small filtered sub-df (predicate pushdown reads only
+        # isotropic_one_gamma_overlay rows from the parquet scan).  Caller concats
+        # these new rows with the full df after reading it separately.
+        # coherent_1g_keep is preserved from the weights parquet via the join above.
+        print("  collecting coherent_1g rows (lazy mode)...")
+        coherent_1g_df = coherent_1g_lf.collect()
+        print(f"  collected {coherent_1g_df.height} coherent-1g rows")
+        return coherent_1g_df
+
+    # Eager path: concat immediately and return full df.
+    # Append reweighted events; original iso1g rows remain but are excluded
+    # downstream by the filter on "isotropic_one_gamma_overlay".
+    # coherent_1g_keep comes from the weights parquet via the join above.
+    # Use diagonal_relaxed so that the coherent_1g_keep column (only present in
+    # coherent_1g_df) is filled with null for all original df rows, avoiding a
+    # full df copy to add that column upfront.
+    print("  starting concat...")
+    coherent_1g_df = coherent_1g_lf.collect()
+    df = pl.concat([df, coherent_1g_df], how="diagonal_relaxed")
+    del coherent_1g_df
+    gc.collect()
+    return df

@@ -1,20 +1,26 @@
+import sys
+from pathlib import Path
+
+# Add project root to path to allow imports with src. prefix
+project_root = Path(__file__).resolve().parent.parent
+if str(project_root) not in sys.path:
+    sys.path.insert(0, str(project_root))
+
 import numpy as np
 import polars as pl
 import xgboost as xgb
 import matplotlib.pyplot as plt
 from matplotlib.colors import LogNorm
-from pathlib import Path
 from sklearn.metrics import confusion_matrix
-from sklearn.model_selection import train_test_split
 from datetime import datetime
 import os
 import argparse
 import time
 
-from signal_categories import topological_category_labels, train_category_labels
-from ntuple_variables.variables import wc_training_vars, combined_training_vars, lantern_training_vars, glee_training_vars, pandora_training_vars, pandora_scalar_training_vars, combined_postprocessing_training_vars
+from src.signal_categories import topological_category_labels, train_category_labels
+from src.ntuple_variables.variables import wc_training_vars, combined_training_vars, lantern_training_vars, glee_training_vars, pandora_training_vars, pandora_scalar_training_vars, combined_postprocessing_training_vars
 
-from file_locations import intermediate_files_location
+from src.file_locations import intermediate_files_location
 
 if __name__ == "__main__":
     main_start_time = time.time()
@@ -62,6 +68,9 @@ if __name__ == "__main__":
         # Binary classification: 0 -> not_nue, 1 -> nue
         signal_category_labels = ["not_nue", "nue"]
         signal_category_var = "del1g_simple_signal_category"
+    elif args.signal_categories == "nc_coh_1g_vs_bkg":
+        signal_category_labels = ["not_NC_coherent_1g_reweighted", "NC_coherent_1g_reweighted"]
+        signal_category_var = "filetype"
     else:
         raise ValueError(f"Invalid signal_categories: {args.signal_categories}")
 
@@ -86,17 +95,11 @@ if __name__ == "__main__":
     # splitting into train and test, then re-making all_df
     no_data_df = all_df.filter(pl.col("filetype") != "data")
     data_df = all_df.filter(pl.col("filetype") == "data")
-    train_indices, test_indices = train_test_split(np.arange(no_data_df.height), test_size=0.5, random_state=42)
     
-    # Create boolean arrays for train/test flags
-    used_for_training = np.zeros(no_data_df.height, dtype=bool)
-    used_for_testing = np.zeros(no_data_df.height, dtype=bool)
-    used_for_training[train_indices] = True
-    used_for_testing[test_indices] = True
-    
+    train_fraction = 0.5
     no_data_df = no_data_df.with_columns([
-        pl.Series("used_for_training", used_for_training),
-        pl.Series("used_for_testing", used_for_testing)
+        (pl.col("train_test_score") < train_fraction).alias("used_for_training"),
+        (pl.col("train_test_score") >= train_fraction).alias("used_for_testing")
     ])
     
     data_df = data_df.with_columns([
@@ -109,7 +112,23 @@ if __name__ == "__main__":
     # Preselection: WC generic neutrino selection
     # (should already be applied in the presel_df_train_vars.pkl file)
     original_num_events = no_data_df.height
-    presel_df = no_data_df.filter(pl.col("wc_kine_reco_Enu") > 0)
+
+    presel_df = no_data_df.filter(pl.col("wc_kine_reco_Enu") > 0) # not necessary, already applied in presel_df_train_vars.parquet
+
+    if args.signal_categories == "nc_coh_1g_vs_bkg":
+        # don't use Iso1g or Del1g events for training/testing
+        presel_df = presel_df.filter((pl.col("filetype") != "isotropic_one_gamma_overlay") & (pl.col("filetype") != "delete_one_gamma_overlay"))
+
+        # only use sampled NC Coherent 1g events, in order to get a coherent 1g shape without event weights
+        presel_df = presel_df.filter(
+            ((pl.col("filetype") == "NC_coherent_1g_reweighted") & (pl.col("coherent_1g_keep") == True))
+            | (pl.col("filetype") != "NC_coherent_1g_reweighted")
+        )
+
+    else:
+        # don't use 1mu1g rad. corr. events or NC Coherent 1g events for training/testing, since these are already included in the Del1g and Iso1g training
+        presel_df = presel_df.filter((pl.col("filetype") != "numuCC_rad_corrected") & (pl.col("filetype") != "NC_coherent_1g_reweighted"))
+
     preselected_num_events = presel_df.height
     print(f"Preselected {preselected_num_events} / {original_num_events} events")
 
@@ -132,20 +151,30 @@ if __name__ == "__main__":
     x_train = presel_train_df.select(training_vars).to_numpy()
     x_train = x_train.astype(np.float64)
     x_train[(x_train > 1e10) | (x_train < -1e10)] = np.nan
-
-    y_train = presel_train_df.select(signal_category_var).to_numpy()
-    y_train = y_train.flatten() if y_train.ndim > 1 else y_train
-    w_train = presel_train_df.select("wc_net_weight").to_numpy()
-    w_train = w_train.flatten() if w_train.ndim > 1 else w_train
-
     x_test = presel_test_df.select(training_vars).to_numpy()
     x_test = x_test.astype(np.float64)
     x_test[(x_test > 1e10) | (x_test < -1e10)] = np.nan
 
-    y_test = presel_test_df.select(signal_category_var).to_numpy()
-    y_test = y_test.flatten() if y_test.ndim > 1 else y_test
+    w_train = presel_train_df.select("wc_net_weight").to_numpy()
+    w_train = w_train.flatten() if w_train.ndim > 1 else w_train
     w_test = presel_test_df.select("wc_net_weight").to_numpy()
     w_test = w_test.flatten() if w_test.ndim > 1 else w_test
+
+    y_train = presel_train_df.select(signal_category_var).to_numpy()
+    y_test = presel_test_df.select(signal_category_var).to_numpy()
+
+    if args.signal_categories == "nc_coh_1g_vs_bkg":
+        w_train = np.ones(w_train.shape)
+        w_test = np.ones(w_test.shape)
+        y_train = presel_train_df.select((pl.col("filetype") == "NC_coherent_1g_reweighted") & pl.col("wc_truth_inFV")).to_numpy()
+        y_test = presel_test_df.select((pl.col("filetype") == "NC_coherent_1g_reweighted") & pl.col("wc_truth_inFV")).to_numpy()
+
+    y_train = y_train.flatten() if y_train.ndim > 1 else y_train
+    y_test = y_test.flatten() if y_test.ndim > 1 else y_test
+
+    print("num training signal:", np.sum(y_train == 1))
+    print("num training background:", np.sum(y_train == 0))
+    print(f"{y_train[:20]=}")
 
     num_training_vars = len(training_vars)
     print(f"{num_training_vars=}")
@@ -304,13 +333,13 @@ if __name__ == "__main__":
         plt.subplot(n_rows, n_cols, i + 1)
         mask = (y_test == i)
         if np.sum(mask) > 0:
-            plt.hist(y_proba[mask, i], bins=bins, histtype='step', label=f'True {train_category_labels[i]}', density=True)
+            plt.hist(y_proba[mask, i], bins=bins, histtype='step', label=f'True {signal_category_labels[i]}', density=True)
             other_mask = (y_test != i)
             if np.sum(other_mask) > 0:
                 plt.hist(y_proba[other_mask, i], bins=bins, histtype='step', label=f'Other categories', density=True)
-        plt.xlabel(f'Probability for {train_category_labels[i]}')
+        plt.xlabel(f'Probability for {signal_category_labels[i]}')
         plt.ylabel('Density')
-        plt.title(f'Probability Distribution: {train_category_labels[i]}')
+        plt.title(f'Probability Distribution: {signal_category_labels[i]}')
         plt.legend()
     plt.tight_layout()
     plt.savefig(output_dir / "probability_histograms.png", dpi=300, bbox_inches='tight')
@@ -346,8 +375,8 @@ if __name__ == "__main__":
     for i in range(n_categories):
         for j in range(n_categories):
             plt.text(j, i, str(int(cm[i, j])), ha='center', va='center', fontsize=8)
-    plt.xticks(range(n_categories), [train_category_labels[i] for i in range(n_categories)], rotation=45)
-    plt.yticks(range(n_categories), [train_category_labels[i] for i in range(n_categories)])
+    plt.xticks(range(n_categories), [signal_category_labels[i] for i in range(n_categories)], rotation=45)
+    plt.yticks(range(n_categories), [signal_category_labels[i] for i in range(n_categories)])
     plt.subplot(1, 3, 2)
     im2 = plt.imshow(cm_normalized_cols, cmap='Blues', aspect='auto')
     plt.colorbar(im2)
@@ -357,8 +386,8 @@ if __name__ == "__main__":
     for i in range(n_categories):
         for j in range(n_categories):
             plt.text(j, i, f'{cm_normalized_cols[i, j]:.2f}', ha='center', va='center', fontsize=8)
-    plt.xticks(range(n_categories), [train_category_labels[i] for i in range(n_categories)], rotation=45)
-    plt.yticks(range(n_categories), [train_category_labels[i] for i in range(n_categories)])
+    plt.xticks(range(n_categories), [signal_category_labels[i] for i in range(n_categories)], rotation=45)
+    plt.yticks(range(n_categories), [signal_category_labels[i] for i in range(n_categories)])
     plt.subplot(1, 3, 3)
     im3 = plt.imshow(cm_normalized_rows, cmap='Blues', aspect='auto')
     plt.colorbar(im3)
@@ -368,8 +397,8 @@ if __name__ == "__main__":
     for i in range(n_categories):
         for j in range(n_categories):
             plt.text(j, i, f'{cm_normalized_rows[i, j]:.2f}', ha='center', va='center', fontsize=8)
-    plt.xticks(range(n_categories), [train_category_labels[i] for i in range(n_categories)], rotation=45)
-    plt.yticks(range(n_categories), [train_category_labels[i] for i in range(n_categories)])
+    plt.xticks(range(n_categories), [signal_category_labels[i] for i in range(n_categories)], rotation=45)
+    plt.yticks(range(n_categories), [signal_category_labels[i] for i in range(n_categories)])
     plt.tight_layout()
     plt.savefig(output_dir / "confusion_matrix.png", dpi=300, bbox_inches='tight')
     plt.close()
@@ -383,6 +412,7 @@ if __name__ == "__main__":
     
     # Build prediction dataframe columns
     prediction_cols = [
+        all_df.select("filename"),
         all_df.select("filetype"),
         all_df.select("run"),
         all_df.select("subrun"),
@@ -392,10 +422,17 @@ if __name__ == "__main__":
     ]
     for i in range(n_categories):
         prediction_cols.append(pl.DataFrame({
-            f'prob_{train_category_labels[i]}': all_probabilities[:, i]
+            f'prob_{signal_category_labels[i]}': all_probabilities[:, i]
         }))
     
     prediction_df = pl.concat(prediction_cols, how="horizontal")
+
+    dup_mask = pl.struct("filename", "filetype", "run", "subrun", "event").is_duplicated()
+    n_dups = prediction_df.select(dup_mask.sum()).item()
+    if n_dups > 0:
+        dups = prediction_df.filter(dup_mask).select(["filename", "filetype", "run", "subrun", "event"])
+        print(f"Found {n_dups} duplicate rows in predictions, first 10:\n{dups.head(10)}")
+        raise ValueError("Duplicate filename/filetype/run/subrun/event in predictions!")
 
     print("Saving predictions...")
     prediction_df.write_parquet(output_dir / "predictions.parquet")

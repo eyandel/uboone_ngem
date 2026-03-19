@@ -41,7 +41,7 @@ def process_rw_sys_root_file(filename, frac_events = 1):
     elif "beam_on" in filename.lower():
         filetype = "data"
     else:
-        raise ValueError("Unknown filetype!", filename, filetype)
+        raise ValueError("Unknown filetype!", filename)
 
     if filetype == "data" or filetype == "ext" or filetype == "isotropic_one_gamma_overlay" or filetype == "delete_one_gamma_overlay":
         raise ValueError("Data, EXT, and 1g overlay files don't have systematics variables!")
@@ -99,18 +99,23 @@ def process_rw_sys_root_file(filename, frac_events = 1):
         detailed_run_period = "4c"
     elif "4d.root" in filename:
         detailed_run_period = "4d"
+    elif "4bcd.root" in filename:
+        detailed_run_period = "4bcd"
     elif "5.root" in filename:
         detailed_run_period = "5"
-    elif "run4b" in filename.lower(): # if the filename doesn't end with the run period, look for run strings in the file names
+    
+    elif "4a" in filename.lower(): # if the filename doesn't end with the run period, look for run strings in the file names
+        detailed_run_period = "4a"
+    elif "run4b" in filename.lower():
         detailed_run_period = "4b"
     elif "run4c" in filename.lower():
         detailed_run_period = "4c"
     elif "run4d" in filename.lower():
         detailed_run_period = "4d"
+    elif "run4bcd" in filename.lower():
+        detailed_run_period = "4bcd"
     elif "run5" in filename.lower():
         detailed_run_period = "5"
-    elif "run45" in filename.lower():
-        detailed_run_period = "45"
     else:
         raise ValueError("Invalid detailed run period!", filename)
 
@@ -166,6 +171,9 @@ if __name__ == "__main__":
         if "UNUSED" in filename or "older_downloads" in filename:
             continue
 
+        if "nfs000000150070ba7d00000751" in filename: # TEMPORARY: weird file in directory now
+            continue
+
         if "beam_on" in filename.lower() or "beamon" in filename.lower():
             continue
         if "beam_off" in filename.lower() or "beamoff" in filename.lower() or "ext" in filename.lower():
@@ -204,6 +212,44 @@ if __name__ == "__main__":
         raise ValueError("No events in the dataframe!")
     
     print(f"presel_weights_df.height={presel_weights_df.height}")
+
+    # Extend presel_weights_df with derived event types that have no GENIE systematics.
+    # numuCC_rad_corrected comes from delete_one_gamma_overlay files, and
+    # NC_coherent_1g_reweighted comes from isotropic_one_gamma_overlay files.
+    # Neither source file has GENIE weight trees, so we assign unit CV weights and
+    # unit systematic weights (all-ones lists matching the shape of existing columns).
+    print("Adding derived event types (rad_corrected, coherent_1g) with unit systematic weights...")
+    presel_df_path = f"{intermediate_files_location}/presel_df_train_vars.parquet"
+    if os.path.exists(presel_df_path):
+        derived_events = pl.scan_parquet(presel_df_path).filter(
+            pl.col("filetype").is_in(["numuCC_rad_corrected", "NC_coherent_1g_reweighted"])
+        ).select(["run", "subrun", "event", "filetype", "detailed_run_period", "filename", "wc_kine_reco_Enu"]).collect()
+
+        print(f"  found {derived_events.height} derived events in presel_df_train_vars.parquet")
+
+        if derived_events.height > 0:
+            # Build unit CV weights
+            derived_events = derived_events.with_columns([
+                pl.lit(1.0).cast(pl.Float32).alias("weightSpline"),
+                pl.lit(1.0).cast(pl.Float32).alias("weightTune"),
+                pl.lit(1.0).cast(pl.Float32).alias("weightSplineTimesTune"),
+            ])
+
+            # Build unit systematic list columns matching shape of existing presel_weights_df
+            sys_list_cols = [c for c, t in presel_weights_df.schema.items() if isinstance(t, pl.List)]
+            n = derived_events.height
+            for col in sys_list_cols:
+                list_len = len(presel_weights_df[col][0])
+                derived_events = derived_events.with_columns(
+                    pl.Series(col, [[1.0] * list_len] * n, dtype=pl.List(pl.Float32))
+                )
+
+            presel_weights_df = pl.concat([presel_weights_df, derived_events], how="diagonal_relaxed")
+            print(f"  presel_weights_df now has {presel_weights_df.height} rows after adding derived events")
+        else:
+            print("  WARNING: no derived events found; skipping extension")
+    else:
+        print(f"  WARNING: {presel_df_path} not found; skipping derived event extension")
 
     print(f"saving {intermediate_files_location}/presel_weights_df.parquet...", end="", flush=True)
     start_time = time.time()
